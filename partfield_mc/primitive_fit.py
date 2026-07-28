@@ -47,6 +47,21 @@ class PrimitiveFitConfig:
     interface_max_sides: int = 8
     interface_min_width_ratio: float = 0.006
     interface_plane_tolerance_ratio: float = 1e-6
+    part_mode: str = "closed"
+    patch_min_segment_area_ratio: float = 0.10
+    patch_min_area_balance: float = 0.30
+    patch_min_interface_area_ratio: float = 0.14
+    patch_min_seam_length_ratio: float = 0.75
+    surface_main_body_min_area_ratio: float = 0.35
+    surface_boundary_rings: int = 0
+    surface_search_steps: int = 18
+    surface_min_reduction_ratio: float = 0.15
+    surface_hard_max_faces: int = 512
+    validation_policy: str = "repair"
+    contact_weak_threshold: float = 0.20
+    contact_strong_threshold: float = 0.55
+    contact_min_edge_count: int = 6
+    contact_medium_mode: str = "connector"
     category: str = "generic"
     forward_axis: str = "auto"
     seed: int = 12345
@@ -197,6 +212,37 @@ class _SourceContact:
     interface_normal: np.ndarray
     interface_axis_u: np.ndarray
     interface_axis_v: np.ndarray
+
+
+@dataclass(frozen=True)
+class _ContactStrength:
+    """Scale-normalised source contact classification used by auto mode."""
+
+    segment_a: int
+    segment_b: int
+    classification: str
+    score: float
+    interface_area_ratio: float
+    seam_length_ratio: float
+    edge_count_ratio: float
+    point_count_ratio: float
+    edge_count: int
+    unique_point_count: int
+    forced_weak_by_edge_count: bool
+
+    def as_dict(self) -> dict[str, object]:
+        return {
+            "segments": [int(self.segment_a), int(self.segment_b)],
+            "classification": str(self.classification),
+            "score": float(self.score),
+            "interface_area_ratio": float(self.interface_area_ratio),
+            "seam_length_ratio": float(self.seam_length_ratio),
+            "edge_count_ratio": float(self.edge_count_ratio),
+            "point_count_ratio": float(self.point_count_ratio),
+            "edge_count": int(self.edge_count),
+            "unique_point_count": int(self.unique_point_count),
+            "forced_weak_by_edge_count": bool(self.forced_weak_by_edge_count),
+        }
 
 
 @dataclass(frozen=True)
@@ -995,15 +1041,27 @@ def _interface_side_sign(
     segment_id: int,
     source_center: np.ndarray,
 ) -> float:
-    signed = float(
-        np.dot(
-            np.asarray(source_center, dtype=np.float64) - np.asarray(interface.anchor),
-            np.asarray(interface.normal_a_to_b),
-        )
+    """Return the immutable side assigned by the source label pair.
+
+    ``normal_a_to_b`` is constructed from ``segment_a`` toward ``segment_b``.
+    Therefore segment A must remain on the negative half-space and segment B
+    on the positive half-space.  V25 inferred this sign from each cluster's
+    centroid; for curved or crescent-shaped parts both centroids can lie on the
+    same side of the fitted interface plane, causing identical cap orientation
+    and a false frozen-interface validation failure.  The label ordering is the
+    stable source-of-truth and does not depend on the primitive approximation.
+    """
+
+    del source_center  # Kept in the signature for call-site compatibility.
+    segment_id = int(segment_id)
+    if segment_id == int(interface.segment_a):
+        return -1.0
+    if segment_id == int(interface.segment_b):
+        return 1.0
+    raise ValueError(
+        f"Segment {segment_id} is not part of frozen interface "
+        f"{interface.segment_a}<->{interface.segment_b}"
     )
-    if abs(signed) > 1e-10:
-        return 1.0 if signed > 0.0 else -1.0
-    return -1.0 if int(segment_id) == int(interface.segment_a) else 1.0
 
 
 def _polygon_area_3d(points: np.ndarray) -> float:
@@ -1541,6 +1599,81 @@ def _constrain_candidate_with_local_adapters(
     return constrained
 
 
+def _unordered_point_set_error(points_a: np.ndarray, points_b: np.ndarray) -> float:
+    """Symmetric Hausdorff error between two small unordered vertex sets."""
+
+    points_a = np.asarray(points_a, dtype=np.float64)
+    points_b = np.asarray(points_b, dtype=np.float64)
+    if len(points_a) == 0 or len(points_b) == 0:
+        return float("inf")
+    tree_a = cKDTree(points_a)
+    tree_b = cKDTree(points_b)
+    return max(
+        float(np.max(tree_a.query(points_b, k=1)[0])),
+        float(np.max(tree_b.query(points_a, k=1)[0])),
+    )
+
+
+def _candidate_has_exact_interface_faces(
+    candidate: _Candidate,
+    *,
+    segment_id: int,
+    interfaces: Sequence[_FrozenInterface],
+    model_extent: float,
+    plane_tolerance_ratio: float,
+) -> tuple[bool, str]:
+    """Check that every constrained face is exactly the frozen source polygon.
+
+    A convex-hull reconstruction may merge an interface polygon with additional
+    coplanar support vertices.  The resulting face is geometrically on the same
+    plane but is not the original joint and will differ between the two fitted
+    parts.  Fixed-interface mode requires identical point sets, not merely
+    coplanarity, so such candidates must fall back to the local adapter solver.
+    """
+
+    tolerance = max(float(model_extent) * float(plane_tolerance_ratio) * 8.0, 1e-9)
+    face_indices = candidate.metadata.get("frozen_interface_face_indices", {})
+    if not isinstance(face_indices, dict):
+        return False, "candidate has no frozen_interface_face_indices mapping"
+
+    for interface in interfaces:
+        neighbor = int(
+            interface.segment_b
+            if int(segment_id) == int(interface.segment_a)
+            else interface.segment_a
+        )
+        key = str(neighbor)
+        if key not in face_indices:
+            return False, f"missing interface face for neighbor {neighbor}"
+        face_index = int(face_indices[key])
+        if face_index < 0 or face_index >= len(candidate.polygons):
+            return False, f"invalid interface face index {face_index} for neighbor {neighbor}"
+        actual = np.asarray(candidate.vertices, dtype=np.float64)[
+            np.asarray(candidate.polygons[face_index], dtype=np.int64)
+        ]
+        expected = np.asarray(interface.polygon_3d, dtype=np.float64)
+        if len(actual) != len(expected):
+            return False, (
+                f"interface {segment_id}<->{neighbor} vertex count changed "
+                f"from {len(expected)} to {len(actual)}"
+            )
+        error = _unordered_point_set_error(actual, expected)
+        if error > tolerance:
+            return False, (
+                f"interface {segment_id}<->{neighbor} vertex error "
+                f"{error:.6g} exceeds {tolerance:.6g}"
+            )
+        area_expected = max(_polygon_area_3d(expected), model_extent * model_extent * 1e-14)
+        area_actual = _polygon_area_3d(actual)
+        relative_area_error = abs(area_actual - area_expected) / area_expected
+        if relative_area_error > 1e-6:
+            return False, (
+                f"interface {segment_id}<->{neighbor} area changed by "
+                f"{relative_area_error:.6g}"
+            )
+    return True, ""
+
+
 def _constrain_candidate_to_interfaces(
     candidate: _Candidate,
     *,
@@ -1558,7 +1691,7 @@ def _constrain_candidate_to_interfaces(
     """
 
     try:
-        return _constrain_candidate_to_interfaces_convex(
+        constrained = _constrain_candidate_to_interfaces_convex(
             candidate,
             segment_id=segment_id,
             source_center=source_center,
@@ -1566,8 +1699,19 @@ def _constrain_candidate_to_interfaces(
             model_extent=model_extent,
             plane_tolerance_ratio=plane_tolerance_ratio,
         )
+        exact, reason = _candidate_has_exact_interface_faces(
+            constrained,
+            segment_id=segment_id,
+            interfaces=interfaces,
+            model_extent=model_extent,
+            plane_tolerance_ratio=plane_tolerance_ratio,
+        )
+        if not exact:
+            raise ValueError(reason)
+        constrained.metadata["fixed_interface_solver"] = "convex_exact_interface"
+        return constrained
     except (ValueError, QhullError, np.linalg.LinAlgError) as error:
-        return _constrain_candidate_with_local_adapters(
+        constrained = _constrain_candidate_with_local_adapters(
             candidate,
             segment_id=segment_id,
             source_center=source_center,
@@ -1576,6 +1720,16 @@ def _constrain_candidate_to_interfaces(
             plane_tolerance_ratio=plane_tolerance_ratio,
             fallback_reason=f"{type(error).__name__}: {error}",
         )
+        exact, reason = _candidate_has_exact_interface_faces(
+            constrained,
+            segment_id=segment_id,
+            interfaces=interfaces,
+            model_extent=model_extent,
+            plane_tolerance_ratio=plane_tolerance_ratio,
+        )
+        if not exact:
+            raise ValueError(f"Local adapter did not preserve exact interface: {reason}")
+        return constrained
 
 
 def _fit_one_cluster(
@@ -1901,6 +2055,95 @@ def _source_label_contacts(
             interface_axis_v=axis_v,
         )
     return contacts
+
+
+def _classify_contact_strengths(
+    mesh: trimesh.Trimesh,
+    cluster_faces: dict[int, np.ndarray],
+    contacts: dict[tuple[int, int], _SourceContact],
+    interfaces: dict[tuple[int, int], _FrozenInterface],
+    config: PrimitiveFitConfig,
+) -> dict[tuple[int, int], _ContactStrength]:
+    """Classify source seams as strong, medium, or weak.
+
+    The score is scale-normalised and combines four independent signals:
+    reconstructed interface area, seam length, boundary edge count, and unique
+    boundary point count.  A very small edge count always forces a weak joint,
+    which prevents a few accidental PartField adjacency edges from becoming a
+    hard paper-model connection.
+    """
+
+    area_faces = np.asarray(mesh.area_faces, dtype=np.float64)
+    segment_areas = {
+        int(segment_id): max(float(np.sum(area_faces[np.asarray(face_ids, dtype=np.int64)])), 1e-12)
+        for segment_id, face_ids in cluster_faces.items()
+    }
+    segment_face_counts = {
+        int(segment_id): max(int(len(face_ids)), 1)
+        for segment_id, face_ids in cluster_faces.items()
+    }
+    results: dict[tuple[int, int], _ContactStrength] = {}
+    weak_threshold = float(config.contact_weak_threshold)
+    strong_threshold = float(config.contact_strong_threshold)
+    minimum_edges = max(int(config.contact_min_edge_count), 1)
+
+    for pair, contact in contacts.items():
+        a, b = map(int, pair)
+        minimum_area = max(min(segment_areas[a], segment_areas[b]), 1e-12)
+        minimum_faces = max(min(segment_face_counts[a], segment_face_counts[b]), 1)
+        interface = interfaces.get(pair)
+        interface_area = float(interface.area) if interface is not None else 0.0
+        area_ratio = interface_area / minimum_area
+        seam_ratio = float(contact.boundary_length) / max(float(np.sqrt(minimum_area)), 1e-12)
+        root_faces = max(float(np.sqrt(minimum_faces)), 1.0)
+        edge_ratio = float(contact.edge_count) / root_faces
+        unique_points = int(len(np.asarray(contact.boundary_points)))
+        point_ratio = float(unique_points) / root_faces
+
+        # Saturating reference values make the thresholds stable across
+        # simplification densities.  Interface area is the strongest cue; seam
+        # and discrete point evidence provide independent support.
+        area_component = float(np.clip(area_ratio / 0.10, 0.0, 1.0))
+        seam_component = float(np.clip(seam_ratio / 0.85, 0.0, 1.0))
+        edge_component = float(np.clip(edge_ratio / 2.0, 0.0, 1.0))
+        point_component = float(np.clip(point_ratio / 2.0, 0.0, 1.0))
+        score = float(
+            0.50 * area_component
+            + 0.25 * seam_component
+            + 0.15 * edge_component
+            + 0.10 * point_component
+        )
+        forced_weak = bool(
+            int(contact.edge_count) < minimum_edges
+            or unique_points < minimum_edges
+        )
+        if forced_weak or score < weak_threshold:
+            classification = "weak"
+        elif score >= strong_threshold:
+            classification = "strong"
+        else:
+            classification = "medium"
+        results[pair] = _ContactStrength(
+            segment_a=a,
+            segment_b=b,
+            classification=classification,
+            score=score,
+            interface_area_ratio=float(area_ratio),
+            seam_length_ratio=float(seam_ratio),
+            edge_count_ratio=float(edge_ratio),
+            point_count_ratio=float(point_ratio),
+            edge_count=int(contact.edge_count),
+            unique_point_count=unique_points,
+            forced_weak_by_edge_count=forced_weak,
+        )
+        print(
+            "[PrimitiveContactStrength] "
+            f"edge={pair} class={classification} score={score:.4f} "
+            f"area_ratio={area_ratio:.5f} seam_ratio={seam_ratio:.4f} "
+            f"edges={int(contact.edge_count)} points={unique_points}",
+            flush=True,
+        )
+    return results
 
 
 def _contact_spanning_tree(
@@ -2855,6 +3098,148 @@ def _enforce_primitive_contacts_connector(
     return records, connectors
 
 
+def _part_bulk_signed_distance_to_interface(
+    part: PrimitivePart,
+    interface_face_index: int,
+    anchor: np.ndarray,
+    normal: np.ndarray,
+) -> float:
+    """Global signed-position diagnostic excluding the immutable cap.
+
+    A constrained main body may legitimately curve across an attachment plane,
+    so this value is informative but must not be used as the connectivity gate.
+    """
+
+    vertices = np.asarray(part.vertices, dtype=np.float64)
+    cap_ids = set(int(value) for value in part.polygons[int(interface_face_index)])
+    body_ids = [index for index in range(len(vertices)) if index not in cap_ids]
+    if body_ids:
+        samples = vertices[np.asarray(body_ids, dtype=np.int64)]
+    else:
+        samples = np.asarray(part.source_center, dtype=np.float64).reshape(1, 3)
+    signed = (samples - np.asarray(anchor, dtype=np.float64)[None, :]) @ np.asarray(
+        normal, dtype=np.float64
+    )
+    return float(np.median(signed))
+
+
+def _part_local_signed_distance_to_interface(
+    part: PrimitivePart,
+    interface_face_index: int,
+    anchor: np.ndarray,
+    normal: np.ndarray,
+) -> tuple[float, int]:
+    """Measure which side the shell occupies immediately beside its cap.
+
+    The previous validator used the median of every non-cap vertex.  That works
+    for convex primitives, but it rejects valid constrained surfaces such as an
+    apple body: most of the fruit can cross the infinite interface plane even
+    though the triangles directly attached to the cap lie on the correct local
+    side.  Paper-model connectivity is local, so inspect the third vertices of
+    faces sharing cap edges instead.
+    """
+
+    vertices = np.asarray(part.vertices, dtype=np.float64)
+    polygons = [[int(value) for value in polygon] for polygon in part.polygons]
+    cap = polygons[int(interface_face_index)]
+    cap_ids = set(cap)
+    cap_edges = {tuple(sorted((a, b))) for a, b in zip(cap, cap[1:] + cap[:1])}
+    samples: list[np.ndarray] = []
+
+    for face_index, polygon in enumerate(polygons):
+        if face_index == int(interface_face_index):
+            continue
+        face_edges = {
+            tuple(sorted((a, b)))
+            for a, b in zip(polygon, polygon[1:] + polygon[:1])
+        }
+        if not cap_edges.intersection(face_edges):
+            continue
+        non_cap = [vertex_id for vertex_id in polygon if vertex_id not in cap_ids]
+        if non_cap:
+            samples.extend(vertices[np.asarray(non_cap, dtype=np.int64)])
+        else:
+            samples.append(vertices[np.asarray(polygon, dtype=np.int64)].mean(axis=0))
+
+    # Degenerate triangulations may share only cap vertices rather than a full
+    # edge.  Retain a narrow fallback around the interface without reverting to
+    # the global body median.
+    if not samples:
+        for face_index, polygon in enumerate(polygons):
+            if face_index == int(interface_face_index):
+                continue
+            if len(cap_ids.intersection(polygon)) < 2:
+                continue
+            non_cap = [vertex_id for vertex_id in polygon if vertex_id not in cap_ids]
+            if non_cap:
+                samples.extend(vertices[np.asarray(non_cap, dtype=np.int64)])
+
+    if not samples:
+        return (
+            _part_bulk_signed_distance_to_interface(
+                part, interface_face_index, anchor, normal
+            ),
+            0,
+        )
+
+    sample_array = np.asarray(samples, dtype=np.float64).reshape(-1, 3)
+    signed = (sample_array - np.asarray(anchor, dtype=np.float64)[None, :]) @ np.asarray(
+        normal, dtype=np.float64
+    )
+    return float(np.median(signed)), int(len(signed))
+
+
+def _best_interface_face_index(
+    part: PrimitivePart,
+    interface: _FrozenInterface,
+) -> int | None:
+    """Find the face that most closely represents a missing frozen interface."""
+
+    vertices = np.asarray(part.vertices, dtype=np.float64)
+    anchor = np.asarray(interface.anchor, dtype=np.float64)
+    normal = np.asarray(interface.normal_a_to_b, dtype=np.float64)
+    expected = np.asarray(interface.polygon_3d, dtype=np.float64)
+    expected_area = max(float(interface.area), 1e-15)
+    extent = max(float(np.max(np.ptp(vertices, axis=0))), 1e-8)
+    best: tuple[float, int] | None = None
+    for face_index, polygon in enumerate(part.polygons):
+        if len(polygon) < 3:
+            continue
+        points = vertices[np.asarray(polygon, dtype=np.int64)]
+        plane = float(np.mean(np.abs((points - anchor[None, :]) @ normal))) / extent
+        center = float(np.linalg.norm(points.mean(axis=0) - anchor)) / extent
+        area = _polygon_area_3d(points)
+        area_error = abs(area - expected_area) / expected_area
+        vertex_penalty = abs(len(points) - len(expected)) / max(len(expected), 1)
+        score = 3.0 * plane + center + 0.25 * area_error + 0.5 * vertex_penalty
+        if best is None or score < best[0]:
+            best = (float(score), int(face_index))
+    return None if best is None else int(best[1])
+
+
+def _canonicalize_part_interface_face(
+    part: PrimitivePart,
+    face_index: int,
+    interface: _FrozenInterface,
+) -> tuple[bool, float]:
+    """Snap an existing cap loop to the canonical frozen polygon in cyclic order."""
+
+    polygon = [int(value) for value in part.polygons[int(face_index)]]
+    expected = np.asarray(interface.polygon_3d, dtype=np.float64)
+    if len(polygon) != len(expected) or len(polygon) < 3:
+        return False, float("inf")
+    actual = np.asarray(part.vertices, dtype=np.float64)[np.asarray(polygon, dtype=np.int64)]
+    mapping = _cyclic_loop_mapping(expected, actual)
+    if mapping is None:
+        return False, float("inf")
+    order, error = mapping
+    vertex_ids = np.asarray(polygon, dtype=np.int64)[order]
+    vertices = np.asarray(part.vertices, dtype=np.float64).copy()
+    vertices[vertex_ids] = expected
+    part.vertices = vertices
+    return True, float(error)
+
+
 def _enforce_primitive_contacts_fixed(
     source_parts: list[PrimitivePart],
     contacts: dict[tuple[int, int], _SourceContact],
@@ -2898,14 +3283,79 @@ def _enforce_primitive_contacts_fixed(
     records: list[dict[str, object]] = []
     connectors: list[PrimitivePart] = []
     record_by_pair: dict[tuple[int, int], dict[str, object]] = {}
+    validation_policy = str(config.validation_policy).strip().lower()
 
     for pair, interface in sorted(frozen_interfaces.items()):
         if pair[0] not in by_id or pair[1] not in by_id:
             continue
         part_a = by_id[pair[0]]
         part_b = by_id[pair[1]]
-        face_a = int(part_a.metadata["frozen_interface_face_indices"][str(pair[1])])
-        face_b = int(part_b.metadata["frozen_interface_face_indices"][str(pair[0])])
+        mapping_a = part_a.metadata.setdefault("frozen_interface_face_indices", {})
+        mapping_b = part_b.metadata.setdefault("frozen_interface_face_indices", {})
+        face_a_value = mapping_a.get(str(pair[1])) if isinstance(mapping_a, dict) else None
+        face_b_value = mapping_b.get(str(pair[0])) if isinstance(mapping_b, dict) else None
+        face_a = int(face_a_value) if face_a_value is not None else -1
+        face_b = int(face_b_value) if face_b_value is not None else -1
+        if face_a < 0 or face_a >= len(part_a.polygons):
+            recovered = _best_interface_face_index(part_a, interface)
+            if recovered is not None:
+                face_a = int(recovered)
+                if isinstance(mapping_a, dict):
+                    mapping_a[str(pair[1])] = int(face_a)
+        if face_b < 0 or face_b >= len(part_b.polygons):
+            recovered = _best_interface_face_index(part_b, interface)
+            if recovered is not None:
+                face_b = int(recovered)
+                if isinstance(mapping_b, dict):
+                    mapping_b[str(pair[0])] = int(face_b)
+        missing_face = bool(
+            face_a < 0
+            or face_a >= len(part_a.polygons)
+            or face_b < 0
+            or face_b >= len(part_b.polygons)
+        )
+        canonical_repair_a = False
+        canonical_repair_b = False
+        canonical_repair_error_a = float("inf")
+        canonical_repair_error_b = float("inf")
+        if not missing_face and validation_policy == "repair":
+            canonical_repair_a, canonical_repair_error_a = _canonicalize_part_interface_face(
+                part_a, face_a, interface
+            )
+            canonical_repair_b, canonical_repair_error_b = _canonicalize_part_interface_face(
+                part_b, face_b, interface
+            )
+        if missing_face:
+            print(
+                f"[PrimitiveContact][WARNING] missing fixed-interface face mapping for edge={pair}; "
+                f"policy={validation_policy}",
+                flush=True,
+            )
+            if validation_policy == "strict":
+                raise ValueError(f"Missing frozen interface face for edge {pair}")
+            # Keep a diagnostic record and continue the remaining model.
+            tree_edge = tree_by_pair.get(pair)
+            parent_id = int(tree_edge["parent"]) if tree_edge is not None else int(pair[0])
+            child_id = int(tree_edge["child"]) if tree_edge is not None else int(pair[1])
+            record = {
+                "parent_segment_id": parent_id,
+                "child_segment_id": child_id,
+                "source_adjacent": True,
+                "contact_mode": "fixed_interface_unresolved",
+                "connector_segment_id": None,
+                "parent_face_index": int(max(face_a, 0)),
+                "child_face_index": int(max(face_b, 0)),
+                "contact_area": 0.0,
+                "plane_error": float("inf"),
+                "connected": False,
+                "validation_policy": validation_policy,
+                "validation_warning": "missing_interface_face",
+                "source_interface_geometry_changed": False,
+                "main_part_rigid_transform_applied": False,
+            }
+            records.append(record)
+            record_by_pair[pair] = record
+            continue
         points_a, _, normal_a = _face_geometry(part_a, face_a)
         points_b, _, normal_b = _face_geometry(part_b, face_b)
         tree_edge = tree_by_pair.get(pair)
@@ -2915,25 +3365,122 @@ def _enforce_primitive_contacts_fixed(
         else:
             parent_id, child_id = int(pair[0]), int(pair[1])
 
+        interface_normal = np.asarray(interface.normal_a_to_b, dtype=np.float64)
+        interface_anchor = np.asarray(interface.anchor, dtype=np.float64)
         plane_error = max(
-            float(np.max(np.abs((points_a - interface.anchor[None, :]) @ interface.normal_a_to_b))),
-            float(np.max(np.abs((points_b - interface.anchor[None, :]) @ interface.normal_a_to_b))),
+            float(np.max(np.abs((points_a - interface_anchor[None, :]) @ interface_normal))),
+            float(np.max(np.abs((points_b - interface_anchor[None, :]) @ interface_normal))),
         )
-        tree_a = cKDTree(points_a)
-        tree_b = cKDTree(points_b)
-        vertex_error = max(
-            float(np.max(tree_a.query(points_b, k=1)[0])),
-            float(np.max(tree_b.query(points_a, k=1)[0])),
-        )
+        vertex_error = _unordered_point_set_error(points_a, points_b)
+        expected_error_a = _unordered_point_set_error(points_a, interface.polygon_3d)
+        expected_error_b = _unordered_point_set_error(points_b, interface.polygon_3d)
         area_a = _polygon_area_3d(points_a)
         area_b = _polygon_area_3d(points_b)
-        normal_alignment = float(np.clip(-np.dot(normal_a, normal_b), -1.0, 1.0))
-        connected = bool(
-            plane_error <= tolerance
-            and vertex_error <= tolerance * 8.0
-            and min(area_a, area_b) > model_extent * model_extent * 1e-10
-            and normal_alignment > 0.999
+        expected_area = max(
+            float(interface.area),
+            model_extent * model_extent * 1e-14,
         )
+        relative_area_error = max(
+            abs(area_a - expected_area) / expected_area,
+            abs(area_b - expected_area) / expected_area,
+            abs(area_a - area_b) / expected_area,
+        )
+        normal_alignment = float(np.clip(-np.dot(normal_a, normal_b), -1.0, 1.0))
+        bulk_side_a = _part_bulk_signed_distance_to_interface(
+            part_a, face_a, interface_anchor, interface_normal
+        )
+        bulk_side_b = _part_bulk_signed_distance_to_interface(
+            part_b, face_b, interface_anchor, interface_normal
+        )
+        local_side_a, local_sample_count_a = _part_local_signed_distance_to_interface(
+            part_a, face_a, interface_anchor, interface_normal
+        )
+        local_side_b, local_sample_count_b = _part_local_signed_distance_to_interface(
+            part_b, face_b, interface_anchor, interface_normal
+        )
+        expected_sign_a = -1.0 if int(part_a.segment_id) == int(interface.segment_a) else 1.0
+        expected_sign_b = -1.0 if int(part_b.segment_id) == int(interface.segment_a) else 1.0
+        side_margin = max(tolerance * 0.25, model_extent * 1e-10)
+        opposite_bulk_sides = bool(
+            expected_sign_a * bulk_side_a >= -side_margin
+            and expected_sign_b * bulk_side_b >= -side_margin
+            and expected_sign_a != expected_sign_b
+        )
+        local_side_decisive = bool(
+            local_sample_count_a > 0
+            and local_sample_count_b > 0
+            and abs(local_side_a) > side_margin
+            and abs(local_side_b) > side_margin
+        )
+        opposite_local_sides = bool(
+            local_side_a * local_side_b < -(side_margin * side_margin)
+        )
+        expected_local_sides = bool(
+            expected_sign_a * local_side_a >= -side_margin
+            and expected_sign_b * local_side_b >= -side_margin
+            and expected_sign_a != expected_sign_b
+        )
+        # A consistently oriented closed shell has its material immediately
+        # inside the interface cap, opposite the cap's outward normal.  This is
+        # a reliable fallback when the first adjacent ring is numerically flat.
+        cap_interior_side_a = -float(np.dot(normal_a, interface_normal))
+        cap_interior_side_b = -float(np.dot(normal_b, interface_normal))
+        cap_interior_opposite = bool(
+            cap_interior_side_a * cap_interior_side_b < -0.98
+        )
+        cap_expected_sides = bool(
+            expected_sign_a * cap_interior_side_a > 0.90
+            and expected_sign_b * cap_interior_side_b > 0.90
+        )
+        exact_geometry = bool(
+            plane_error <= tolerance
+            and vertex_error <= tolerance
+            and expected_error_a <= tolerance
+            and expected_error_b <= tolerance
+            and relative_area_error <= 1e-6
+            and min(area_a, area_b) > model_extent * model_extent * 1e-10
+        )
+        orientation_valid = bool(normal_alignment > 0.99)
+        if local_side_decisive:
+            side_validation_method = "local_cap_neighbourhood"
+            side_geometry_valid = bool(opposite_local_sides and expected_local_sides)
+        else:
+            side_validation_method = "oriented_cap_fallback"
+            side_geometry_valid = bool(
+                orientation_valid and cap_interior_opposite and cap_expected_sides
+            )
+        strict_connected = bool(exact_geometry and side_geometry_valid)
+        accepted_with_warning = False
+        validation_warning = ""
+        if validation_policy == "strict":
+            connected = strict_connected
+        elif exact_geometry:
+            # Exact shared polygons are the physical paper joint. Side tests are
+            # diagnostic because concave or folded constrained surfaces may cross
+            # the infinite interface plane without breaking that joint.
+            connected = True
+            if not side_geometry_valid:
+                accepted_with_warning = True
+                validation_warning = "exact_interface_with_ambiguous_side_classification"
+                side_validation_method = f"{side_validation_method}_geometry_override"
+        else:
+            connected = False
+            validation_warning = "interface_geometry_not_exact"
+        if not strict_connected:
+            print(
+                "[PrimitiveContact] fixed-interface validation "
+                f"edge={pair} plane={plane_error:.6g} vertex={vertex_error:.6g} "
+                f"expected=({expected_error_a:.6g},{expected_error_b:.6g}) "
+                f"area_rel={relative_area_error:.6g} normal={normal_alignment:.6g} "
+                f"bulk=({bulk_side_a:.6g},{bulk_side_b:.6g}) "
+                f"local=({local_side_a:.6g},{local_side_b:.6g}) "
+                f"local_samples=({local_sample_count_a},{local_sample_count_b}) "
+                f"side_method={side_validation_method} "
+                f"opposite_local={opposite_local_sides} expected_local={expected_local_sides} "
+                f"cap_interior=({cap_interior_side_a:.6g},{cap_interior_side_b:.6g}) "
+                f"cap_expected={cap_expected_sides}",
+                flush=True,
+            )
         record: dict[str, object] = {
             "parent_segment_id": parent_id,
             "child_segment_id": child_id,
@@ -2950,7 +3497,43 @@ def _enforce_primitive_contacts_fixed(
             "interface_fallback_rectangle": bool(interface.fallback_rectangle),
             "plane_error": float(plane_error),
             "shared_vertex_error": float(vertex_error),
+            "expected_interface_error_a": float(expected_error_a),
+            "expected_interface_error_b": float(expected_error_b),
+            "relative_interface_area_error": float(relative_area_error),
             "normal_alignment": float(normal_alignment),
+            "orientation_valid": bool(orientation_valid),
+            "bulk_side_a": float(bulk_side_a),
+            "bulk_side_b": float(bulk_side_b),
+            "opposite_bulk_sides": bool(opposite_bulk_sides),
+            "local_side_a": float(local_side_a),
+            "local_side_b": float(local_side_b),
+            "local_side_sample_count_a": int(local_sample_count_a),
+            "local_side_sample_count_b": int(local_sample_count_b),
+            "local_side_decisive": bool(local_side_decisive),
+            "opposite_local_sides": bool(opposite_local_sides),
+            "expected_local_sides": bool(expected_local_sides),
+            "cap_interior_side_a": float(cap_interior_side_a),
+            "cap_interior_side_b": float(cap_interior_side_b),
+            "cap_interior_opposite": bool(cap_interior_opposite),
+            "cap_expected_sides": bool(cap_expected_sides),
+            "side_validation_method": str(side_validation_method),
+            "side_geometry_valid": bool(side_geometry_valid),
+            "exact_interface_geometry": bool(exact_geometry),
+            "strict_validation_passed": bool(strict_connected),
+            "validation_policy": str(validation_policy),
+            "accepted_with_warning": bool(accepted_with_warning),
+            "validation_warning": str(validation_warning),
+            "canonical_repair_applied_a": bool(canonical_repair_a),
+            "canonical_repair_applied_b": bool(canonical_repair_b),
+            "canonical_repair_error_before_a": float(canonical_repair_error_a),
+            "canonical_repair_error_before_b": float(canonical_repair_error_b),
+            "connection_quality": (
+                "strict"
+                if strict_connected
+                else "exact_geometry_side_ambiguous"
+                if connected and exact_geometry
+                else "unresolved"
+            ),
             "main_part_rigid_transform_applied": False,
             "source_interface_geometry_changed": False,
             "connected": connected,
@@ -3003,6 +3586,73 @@ def _enforce_primitive_contacts_fixed(
         record_by_pair[
             tuple(sorted((int(parent.segment_id), int(child.segment_id))))
         ] = record
+
+    # In repair mode, an unresolved source seam must not terminate the
+    # complete asset.  Add a small explicit paper connector on spanning-tree
+    # edges only; non-tree diagnostic seams may remain warnings without
+    # changing the global assembly connectivity.
+    if validation_policy == "repair":
+        for repair_index, edge in enumerate(tree):
+            pair = tuple(sorted((int(edge["parent"]), int(edge["child"]))))
+            record = record_by_pair.get(pair)
+            if record is None or bool(record.get("connected")):
+                continue
+            parent = by_id[int(edge["parent"])]
+            child = by_id[int(edge["child"])]
+            try:
+                selection = _select_contact_face_pair(
+                    parent,
+                    child,
+                    edge,
+                    model_extent=model_extent,
+                    connector_radius_ratio=config.connector_radius_ratio,
+                    connector_inset_ratio=config.connector_inset_ratio,
+                )
+                connector_id = -3_000_000 - int(repair_index)
+                connector, connector_record = _build_connector_part(
+                    parent,
+                    child,
+                    edge,
+                    selection,
+                    connector_segment_id=connector_id,
+                    model_extent=model_extent,
+                    connector_sides=config.connector_sides,
+                    connector_radius_ratio=config.connector_radius_ratio,
+                    connector_min_length_ratio=config.connector_min_length_ratio,
+                )
+                connector.metadata["fallback_for_failed_fixed_interface"] = True
+                connectors.append(connector)
+                record.update(
+                    {
+                        "contact_mode": "fixed_interface_fallback_connector",
+                        "connector_segment_id": int(connector_id),
+                        "parent_face_index": int(selection["parent_face_index"]),
+                        "child_face_index": int(selection["child_face_index"]),
+                        "contact_area": float(connector_record["contact_area"]),
+                        "connector_length": float(connector_record["connector_length"]),
+                        "patch_radius": float(connector_record["patch_radius"]),
+                        "connected": True,
+                        "accepted_with_warning": True,
+                        "connection_quality": "fallback_connector",
+                        "validation_warning": (
+                            str(record.get("validation_warning", "unresolved_fixed_interface"))
+                            + "; fallback_connector_added"
+                        ),
+                        "connector_repair_error": "",
+                    }
+                )
+                print(
+                    "[PrimitiveContact][WARNING] replaced unresolved fixed-interface "
+                    f"tree edge={pair} with connector segment={connector_id}",
+                    flush=True,
+                )
+            except Exception as error:
+                record["connector_repair_error"] = f"{type(error).__name__}: {error}"
+                print(
+                    "[PrimitiveContact][WARNING] connector fallback failed for "
+                    f"edge={pair}: {type(error).__name__}: {error}",
+                    flush=True,
+                )
 
     for edge in tree:
         parent_id = int(edge["parent"])
@@ -3058,8 +3708,316 @@ def _enforce_primitive_contacts_fixed(
         for record in records
         if not bool(record["connected"])
     ]
-    if failed:
+    warning_records = [
+        {
+            "edge": [int(record["parent_segment_id"]), int(record["child_segment_id"])],
+            "warning": str(record.get("validation_warning", "")),
+            "connection_quality": str(record.get("connection_quality", "unresolved")),
+        }
+        for record in records
+        if bool(record.get("accepted_with_warning")) or not bool(record["connected"])
+    ]
+    for part in source_parts:
+        part.metadata["primitive_validation_policy"] = str(validation_policy)
+        part.metadata["contact_validation_warnings"] = warning_records
+        part.metadata["contact_validation_failed_edges"] = failed
+        part.metadata["contact_validation_completed"] = True
+    if failed and validation_policy == "strict":
         raise ValueError(f"Frozen source-interface validation failed for edges: {failed}")
+    if failed:
+        print(
+            "[PrimitiveContact][WARNING] continuing despite unresolved fixed-interface "
+            f"edges={failed}; see paper_model_parts.json",
+            flush=True,
+        )
+    elif warning_records:
+        print(
+            "[PrimitiveContact][WARNING] exact interface geometry was preserved but "
+            "one or more side classifiers were ambiguous; continuing safely",
+            flush=True,
+        )
+    return records, connectors
+
+
+def _separate_weak_contact_overlaps(
+    source_parts: list[PrimitivePart],
+    weak_pairs: set[tuple[int, int]],
+    protected_pairs: set[tuple[int, int]],
+    contacts: dict[tuple[int, int], _SourceContact],
+    gap_ratio: float,
+) -> list[dict[str, object]]:
+    """Separate weakly attached fitted parts without disturbing hard joints."""
+
+    if not weak_pairs or len(source_parts) < 2:
+        return []
+    by_id = {int(part.segment_id): part for part in source_parts}
+    bounds = np.vstack((
+        np.vstack([part.bounds[0] for part in source_parts]).min(axis=0),
+        np.vstack([part.bounds[1] for part in source_parts]).max(axis=0),
+    ))
+    model_extent = max(float(np.max(bounds[1] - bounds[0])), 1e-8)
+    tolerance = model_extent * 1e-6
+    requested_gap = max(float(gap_ratio), 0.0) * model_extent
+    protected_degree = {segment_id: 0 for segment_id in by_id}
+    for a, b in protected_pairs:
+        if a in protected_degree:
+            protected_degree[a] += 1
+        if b in protected_degree:
+            protected_degree[b] += 1
+    records: list[dict[str, object]] = []
+
+    for pair in sorted(weak_pairs):
+        if pair[0] not in by_id or pair[1] not in by_id:
+            continue
+        part_a, part_b = by_id[pair[0]], by_id[pair[1]]
+        initially_overlapping = bool(_parts_overlap(part_a, part_b, tolerance))
+        record: dict[str, object] = {
+            "segments": [int(pair[0]), int(pair[1])],
+            "initially_overlapping": initially_overlapping,
+            "separation_applied": False,
+            "separation_distance": 0.0,
+            "resolved": not initially_overlapping,
+        }
+        if not initially_overlapping:
+            records.append(record)
+            continue
+
+        # Prefer moving the smaller part that has no strong fixed-interface
+        # dependency.  Moving a strongly constrained part would invalidate a
+        # different joint, so such pairs are reported rather than corrupted.
+        candidates = sorted(
+            (part_a, part_b),
+            key=lambda part: (
+                protected_degree.get(int(part.segment_id), 0) > 0,
+                float(part.source_surface_area),
+                float(part.volume),
+            ),
+        )
+        moving = candidates[0]
+        fixed = part_b if moving is part_a else part_a
+        if protected_degree.get(int(moving.segment_id), 0) > 0:
+            record["reason"] = "both_parts_participate_in_required_contacts"
+            records.append(record)
+            continue
+
+        direction = np.asarray(moving.source_center - fixed.source_center, dtype=np.float64)
+        contact = contacts.get(pair)
+        if float(np.linalg.norm(direction)) <= 1e-12 and contact is not None:
+            direction = np.asarray(contact.direction_a_to_b, dtype=np.float64)
+            if int(moving.segment_id) == int(contact.segment_a):
+                direction *= -1.0
+        if float(np.linalg.norm(direction)) <= 1e-12:
+            direction = np.asarray([1.0, 0.0, 0.0], dtype=np.float64)
+        direction /= max(float(np.linalg.norm(direction)), 1e-12)
+        step = max(model_extent * 0.002, float(np.min(moving.size)) * 0.02, tolerance * 4.0)
+        maximum = max(model_extent * 1.25, step)
+        moved = 0.0
+        while _parts_overlap(fixed, moving, tolerance) and moved < maximum:
+            delta = min(step, maximum - moved)
+            moving.translate(direction * delta)
+            moved += delta
+            step *= 1.25
+        if not _parts_overlap(fixed, moving, tolerance) and requested_gap > 0.0:
+            moving.translate(direction * requested_gap)
+            moved += requested_gap
+        resolved = not _parts_overlap(fixed, moving, tolerance)
+        record.update(
+            {
+                "separation_applied": bool(moved > 0.0),
+                "separation_distance": float(moved),
+                "moved_segment_id": int(moving.segment_id),
+                "fixed_segment_id": int(fixed.segment_id),
+                "resolved": bool(resolved),
+                "reason": "weak_contact_allowed_to_separate" if resolved else "separation_limit_reached",
+            }
+        )
+        moving.metadata.setdefault("weak_contact_separation_transforms", []).append(record.copy())
+        records.append(record)
+    return records
+
+
+def _enforce_primitive_contacts_auto(
+    source_parts: list[PrimitivePart],
+    contacts: dict[tuple[int, int], _SourceContact],
+    frozen_interfaces: dict[tuple[int, int], _FrozenInterface],
+    strengths: dict[tuple[int, int], _ContactStrength],
+    config: PrimitiveFitConfig,
+) -> tuple[list[dict[str, object]], list[PrimitivePart]]:
+    """Apply fixed, connector, or separated handling per source contact."""
+
+    by_id = {int(part.segment_id): part for part in source_parts}
+    records: list[dict[str, object]] = []
+    connectors: list[PrimitivePart] = []
+    connector_counter = 0
+    medium_mode = str(config.contact_medium_mode).strip().lower()
+
+    def append_pair_result(
+        pair: tuple[int, int],
+        pair_records: list[dict[str, object]],
+        pair_connectors: list[PrimitivePart],
+        strength: _ContactStrength,
+    ) -> None:
+        nonlocal connector_counter
+        for connector in pair_connectors:
+            new_id = -4_000_000 - connector_counter
+            connector_counter += 1
+            old_id = int(connector.segment_id)
+            connector.segment_id = int(new_id)
+            connector.metadata["auto_contact_original_connector_segment_id"] = old_id
+            connector.metadata["contact_strength"] = strength.as_dict()
+            for record in pair_records:
+                if record.get("connector_segment_id") == old_id:
+                    record["connector_segment_id"] = int(new_id)
+            connectors.append(connector)
+        for record in pair_records:
+            record["contact_strength_class"] = str(strength.classification)
+            record["contact_strength_score"] = float(strength.score)
+            record["contact_strength_metrics"] = strength.as_dict()
+            record["required_connection"] = strength.classification != "weak"
+            records.append(record)
+
+    for pair, strength in sorted(strengths.items()):
+        if pair[0] not in by_id or pair[1] not in by_id:
+            continue
+        pair_parts = [by_id[pair[0]], by_id[pair[1]]]
+        contact = contacts[pair]
+        if strength.classification == "strong":
+            interface = frozen_interfaces.get(pair)
+            if interface is None:
+                # Classification was strong but interface reconstruction failed;
+                # connector fallback keeps the pipeline alive without moving parts.
+                pair_records, pair_connectors = _enforce_primitive_contacts_connector(
+                    pair_parts, {pair: contact}, config
+                )
+                for record in pair_records:
+                    record["auto_contact_fallback"] = "strong_missing_frozen_interface_connector"
+            else:
+                pair_records, pair_connectors = _enforce_primitive_contacts_fixed(
+                    pair_parts, {pair: contact}, {pair: interface}, config
+                )
+            append_pair_result(pair, pair_records, pair_connectors, strength)
+        elif strength.classification == "medium" and medium_mode == "connector":
+            try:
+                pair_records, pair_connectors = _enforce_primitive_contacts_connector(
+                    pair_parts, {pair: contact}, config
+                )
+                append_pair_result(pair, pair_records, pair_connectors, strength)
+            except Exception as error:
+                record = {
+                    "parent_segment_id": int(pair[0]),
+                    "child_segment_id": int(pair[1]),
+                    "source_adjacent": True,
+                    "contact_mode": "medium_contact_unresolved",
+                    "connector_segment_id": None,
+                    "parent_face_index": 0,
+                    "child_face_index": 0,
+                    "contact_area": 0.0,
+                    "plane_error": float("inf"),
+                    "connected": False,
+                    "required_connection": True,
+                    "accepted_with_warning": True,
+                    "validation_warning": f"{type(error).__name__}: {error}",
+                    "contact_strength_class": "medium",
+                    "contact_strength_score": float(strength.score),
+                    "contact_strength_metrics": strength.as_dict(),
+                }
+                records.append(record)
+                print(
+                    f"[PrimitiveContact][WARNING] medium contact edge={pair} connector failed; "
+                    "continuing without forced intersection",
+                    flush=True,
+                )
+        else:
+            records.append(
+                {
+                    "parent_segment_id": int(pair[0]),
+                    "child_segment_id": int(pair[1]),
+                    "source_adjacent": True,
+                    "contact_mode": (
+                        "weak_contact_separated"
+                        if strength.classification == "weak"
+                        else "medium_contact_separated"
+                    ),
+                    "connector_segment_id": None,
+                    "parent_face_index": -1,
+                    "child_face_index": -1,
+                    "contact_area": 0.0,
+                    "plane_error": 0.0,
+                    "connected": False,
+                    "required_connection": False,
+                    "allowed_to_separate": True,
+                    "contact_strength_class": str(strength.classification),
+                    "contact_strength_score": float(strength.score),
+                    "contact_strength_metrics": strength.as_dict(),
+                }
+            )
+
+    required_records = [record for record in records if bool(record.get("required_connection"))]
+    required_connected = all(bool(record.get("connected")) for record in required_records)
+    weak_pairs = {pair for pair, item in strengths.items() if item.classification == "weak"}
+    protected_pairs = {
+        pair
+        for pair, item in strengths.items()
+        if item.classification == "strong"
+        or (item.classification == "medium" and medium_mode == "connector")
+    }
+    separation_records = _separate_weak_contact_overlaps(
+        source_parts, weak_pairs, protected_pairs, contacts, config.overlap_gap_ratio
+    )
+    separated_by_pair = {tuple(record["segments"]): record for record in separation_records}
+    for record in records:
+        pair = tuple(sorted((int(record["parent_segment_id"]), int(record["child_segment_id"]))))
+        if pair in separated_by_pair:
+            record["weak_overlap_separation"] = separated_by_pair[pair]
+
+    compact = [
+        {
+            "parent_segment_id": int(record["parent_segment_id"]),
+            "child_segment_id": int(record["child_segment_id"]),
+            "contact_mode": str(record["contact_mode"]),
+            "contact_strength_class": str(record.get("contact_strength_class", "unknown")),
+            "contact_strength_score": float(record.get("contact_strength_score", 0.0)),
+            "required_connection": bool(record.get("required_connection", False)),
+            "connected": bool(record.get("connected", False)),
+            "connector_segment_id": record.get("connector_segment_id"),
+        }
+        for record in records
+    ]
+    strength_table = {f"{a}:{b}": item.as_dict() for (a, b), item in sorted(strengths.items())}
+    allowed_separated = [
+        [int(record["parent_segment_id"]), int(record["child_segment_id"])]
+        for record in records
+        if bool(record.get("allowed_to_separate"))
+    ]
+    for part in source_parts:
+        part.metadata["contact_constraint_enabled"] = True
+        part.metadata["contact_mode"] = "auto"
+        part.metadata["contact_strength_classification"] = strength_table
+        part.metadata["contact_tree"] = compact
+        part.metadata["contact_required_graph_connected"] = bool(required_connected)
+        part.metadata["contact_graph_connected"] = bool(required_connected)
+        part.metadata["allowed_separated_contact_edges"] = allowed_separated
+        part.metadata["weak_contact_overlap_separation"] = separation_records
+        part.metadata["main_part_rigid_transform_applied"] = False
+    for connector in connectors:
+        connector.metadata["contact_mode"] = "auto_connector"
+        connector.metadata["contact_required_graph_connected"] = bool(required_connected)
+        connector.metadata["contact_graph_connected"] = bool(required_connected)
+        connector.metadata["contact_tree"] = compact
+
+    failed_required = [
+        [int(record["parent_segment_id"]), int(record["child_segment_id"])]
+        for record in required_records
+        if not bool(record.get("connected"))
+    ]
+    if failed_required and str(config.validation_policy).strip().lower() == "strict":
+        raise ValueError(f"Auto contact validation failed for required edges: {failed_required}")
+    if failed_required:
+        print(
+            "[PrimitiveContact][WARNING] required medium/strong edges remain unresolved "
+            f"but export will continue: {failed_required}",
+            flush=True,
+        )
     return records, connectors
 
 
@@ -3068,6 +4026,7 @@ def _enforce_primitive_contacts(
     contacts: dict[tuple[int, int], _SourceContact],
     config: PrimitiveFitConfig,
     frozen_interfaces: dict[tuple[int, int], _FrozenInterface] | None = None,
+    contact_strengths: dict[tuple[int, int], _ContactStrength] | None = None,
 ) -> tuple[list[dict[str, object]], list[PrimitivePart]]:
     mode = str(config.contact_mode).strip().lower()
     if mode == "move":
@@ -3085,7 +4044,15 @@ def _enforce_primitive_contacts(
         return _enforce_primitive_contacts_fixed(
             source_parts, contacts, frozen_interfaces or {}, config
         )
-    raise ValueError("primitive contact_mode must be 'fixed', 'connector', or 'move'")
+    if mode == "auto":
+        return _enforce_primitive_contacts_auto(
+            source_parts,
+            contacts,
+            frozen_interfaces or {},
+            contact_strengths or {},
+            config,
+        )
+    raise ValueError("primitive contact_mode must be 'auto', 'fixed', 'connector', or 'move'")
 
 
 def _resolve_primitive_overlaps(
@@ -3180,12 +4147,1453 @@ def _resolve_primitive_overlaps(
     return adjustments
 
 
+
+class _UnionFind:
+    def __init__(self, values: Iterable[int]) -> None:
+        self.parent = {int(value): int(value) for value in values}
+
+    def find(self, value: int) -> int:
+        value = int(value)
+        root = value
+        while self.parent[root] != root:
+            root = self.parent[root]
+        while self.parent[value] != value:
+            following = self.parent[value]
+            self.parent[value] = root
+            value = following
+        return root
+
+    def union(self, first: int, second: int) -> None:
+        root_a = self.find(first)
+        root_b = self.find(second)
+        if root_a == root_b:
+            return
+        # Stable representatives make outputs reproducible and keep existing
+        # segment identifiers whenever possible.
+        lower, higher = sorted((root_a, root_b))
+        self.parent[higher] = lower
+
+
+def _segment_patch_shape_metrics(
+    mesh: trimesh.Trimesh,
+    face_ids: np.ndarray,
+) -> dict[str, float]:
+    vertex_ids = np.unique(np.asarray(mesh.faces[face_ids], dtype=np.int64).reshape(-1))
+    points = np.asarray(mesh.vertices[vertex_ids], dtype=np.float64)
+    if len(points) < 3:
+        return {
+            "secondary_axis_ratio": 0.0,
+            "thickness_axis_ratio": 0.0,
+        }
+    centered = points - np.mean(points, axis=0, keepdims=True)
+    covariance = centered.T @ centered / max(len(points), 1)
+    values = np.sort(np.maximum(np.linalg.eigvalsh(covariance), 0.0))[::-1]
+    if len(values) < 3 or values[0] <= 1e-15:
+        return {
+            "secondary_axis_ratio": 0.0,
+            "thickness_axis_ratio": 0.0,
+        }
+    secondary = float(np.sqrt(values[1] / max(values[0], 1e-15)))
+    thickness = float(np.sqrt(values[2] / max(values[1], 1e-15)))
+    return {
+        "secondary_axis_ratio": secondary,
+        "thickness_axis_ratio": thickness,
+    }
+
+
+def _build_hybrid_segment_groups(
+    mesh: trimesh.Trimesh,
+    labels: np.ndarray,
+    cluster_faces: dict[int, np.ndarray],
+    config: PrimitiveFitConfig,
+    *,
+    model_extent: float,
+    total_area: float,
+) -> tuple[
+    np.ndarray,
+    dict[int, np.ndarray],
+    dict[int, list[int]],
+    list[dict[str, object]],
+]:
+    """Merge labels that are surface patches of one continuous main body.
+
+    PartField is a surface segmentation method.  A long, broad seam between two
+    similarly sized regions usually means that one physical body was split into
+    patches (for example, the left and right halves of an apple).  A short,
+    narrow seam usually means a real attachable part (head, leg, tail, stem,
+    leaf).  Hybrid mode removes only the former internal seams before fitting;
+    all remaining groups continue through the existing closed primitive and
+    fixed-interface pipeline.
+    """
+
+    mode = str(config.part_mode).strip().lower()
+    valid_ids = set(int(value) for value in cluster_faces)
+    mapped = np.full(len(labels), -1, dtype=np.int64)
+    for segment_id in valid_ids:
+        mapped[np.asarray(labels, dtype=np.int64) == segment_id] = segment_id
+
+    identity_groups = {
+        int(segment_id): [int(segment_id)] for segment_id in sorted(valid_ids)
+    }
+    if mode == "closed" or len(valid_ids) <= 1:
+        return mapped, dict(cluster_faces), identity_groups, []
+
+    original_contacts = _source_label_contacts(mesh, labels, valid_ids)
+    if not original_contacts:
+        return mapped, dict(cluster_faces), identity_groups, []
+    interface_estimates = _build_frozen_interfaces(
+        original_contacts,
+        model_extent=model_extent,
+        max_sides=config.interface_max_sides,
+        min_width_ratio=config.interface_min_width_ratio,
+    )
+    areas = {
+        int(segment_id): float(np.sum(mesh.area_faces[face_ids]))
+        for segment_id, face_ids in cluster_faces.items()
+    }
+    shapes = {
+        int(segment_id): _segment_patch_shape_metrics(mesh, face_ids)
+        for segment_id, face_ids in cluster_faces.items()
+    }
+
+    # surface-patch is an explicit, more permissive version of auto.  It still
+    # protects thin or elongated appendages and never blindly merges an entire
+    # connected component.
+    threshold_scale = 0.62 if mode == "surface-patch" else 1.0
+    min_segment_area_ratio = float(config.patch_min_segment_area_ratio) * threshold_scale
+    min_area_balance = float(config.patch_min_area_balance) * threshold_scale
+    min_interface_area_ratio = float(config.patch_min_interface_area_ratio) * threshold_scale
+    min_seam_length_ratio = float(config.patch_min_seam_length_ratio) * threshold_scale
+
+    union_find = _UnionFind(valid_ids)
+    decisions: list[dict[str, object]] = []
+    ranked_pairs: list[tuple[float, tuple[int, int], dict[str, object]]] = []
+    for pair, contact in original_contacts.items():
+        interface = interface_estimates.get(pair)
+        if interface is None:
+            continue
+        a, b = int(pair[0]), int(pair[1])
+        area_a = max(areas[a], 1e-15)
+        area_b = max(areas[b], 1e-15)
+        smaller_area = min(area_a, area_b)
+        larger_area = max(area_a, area_b)
+        segment_area_ratio = smaller_area / max(total_area, 1e-15)
+        area_balance = smaller_area / larger_area
+        interface_area_ratio = float(interface.area) / smaller_area
+        seam_length_ratio = float(contact.boundary_length) / max(np.sqrt(smaller_area), 1e-12)
+
+        shape_a = shapes[a]
+        shape_b = shapes[b]
+        # Long/thin limbs and flat leaves are independent paper parts even when
+        # their boundary happens to contain many source edges.
+        protected_a = (
+            segment_area_ratio < 0.25
+            and (
+                shape_a["secondary_axis_ratio"] < 0.30
+                or shape_a["thickness_axis_ratio"] < 0.10
+            )
+        )
+        protected_b = (
+            segment_area_ratio < 0.25
+            and (
+                shape_b["secondary_axis_ratio"] < 0.30
+                or shape_b["thickness_axis_ratio"] < 0.10
+            )
+        )
+        broad_interface = (
+            not bool(interface.fallback_rectangle)
+            and interface_area_ratio >= min_interface_area_ratio
+            and seam_length_ratio >= min_seam_length_ratio
+        )
+        merge = bool(
+            segment_area_ratio >= min_segment_area_ratio
+            and area_balance >= min_area_balance
+            and broad_interface
+            and not protected_a
+            and not protected_b
+        )
+        confidence = float(
+            min(
+                segment_area_ratio / max(min_segment_area_ratio, 1e-12),
+                area_balance / max(min_area_balance, 1e-12),
+                interface_area_ratio / max(min_interface_area_ratio, 1e-12),
+                seam_length_ratio / max(min_seam_length_ratio, 1e-12),
+            )
+        )
+        record: dict[str, object] = {
+            "segments": [a, b],
+            "merge": merge,
+            "confidence": confidence,
+            "segment_area_ratio": float(segment_area_ratio),
+            "area_balance": float(area_balance),
+            "interface_area_ratio": float(interface_area_ratio),
+            "seam_length_ratio": float(seam_length_ratio),
+            "interface_fallback_rectangle": bool(interface.fallback_rectangle),
+            "segment_a_secondary_axis_ratio": float(shape_a["secondary_axis_ratio"]),
+            "segment_b_secondary_axis_ratio": float(shape_b["secondary_axis_ratio"]),
+            "segment_a_thickness_axis_ratio": float(shape_a["thickness_axis_ratio"]),
+            "segment_b_thickness_axis_ratio": float(shape_b["thickness_axis_ratio"]),
+            "protected_thin_or_elongated": bool(protected_a or protected_b),
+            "mode": mode,
+        }
+        decisions.append(record)
+        if merge:
+            ranked_pairs.append((confidence, pair, record))
+
+    # Strongest patch seams are merged first.  Union-find permits one main body
+    # to consist of more than two PartField patches while keeping appendages out.
+    for _, pair, record in sorted(ranked_pairs, key=lambda item: (-item[0], item[1])):
+        union_find.union(pair[0], pair[1])
+        print(
+            "[PrimitiveHybrid] merging surface patches "
+            f"{pair[0]} + {pair[1]} "
+            f"(interface_area_ratio={record['interface_area_ratio']:.3f}, "
+            f"seam_length_ratio={record['seam_length_ratio']:.3f})",
+            flush=True,
+        )
+
+    members_by_root: dict[int, list[int]] = {}
+    for segment_id in sorted(valid_ids):
+        root = union_find.find(segment_id)
+        members_by_root.setdefault(root, []).append(segment_id)
+
+    representative_by_segment: dict[int, int] = {}
+    group_members: dict[int, list[int]] = {}
+    for members in members_by_root.values():
+        representative = min(members)
+        group_members[representative] = sorted(int(value) for value in members)
+        for segment_id in members:
+            representative_by_segment[int(segment_id)] = representative
+
+    grouped_labels = np.full(len(labels), -1, dtype=np.int64)
+    grouped_faces: dict[int, list[np.ndarray]] = {key: [] for key in group_members}
+    labels_array = np.asarray(labels, dtype=np.int64)
+    for segment_id, face_ids in cluster_faces.items():
+        representative = representative_by_segment[int(segment_id)]
+        grouped_labels[face_ids] = representative
+        grouped_faces[representative].append(np.asarray(face_ids, dtype=np.int64))
+    grouped_face_arrays = {
+        representative: np.sort(np.concatenate(chunks)).astype(np.int64)
+        for representative, chunks in grouped_faces.items()
+    }
+
+    print(
+        "[PrimitiveHybrid] fitted groups="
+        + str([group_members[key] for key in sorted(group_members)]),
+        flush=True,
+    )
+    return grouped_labels, grouped_face_arrays, group_members, decisions
+
+
+
+def _local_patch_mesh(
+    mesh: trimesh.Trimesh,
+    face_ids: np.ndarray,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """Extract one face subset while preserving source vertex coordinates."""
+
+    source_faces = np.asarray(mesh.faces[np.asarray(face_ids, dtype=np.int64)], dtype=np.int64)
+    global_vertex_ids = np.unique(source_faces.reshape(-1))
+    remap = {int(global_id): int(local_id) for local_id, global_id in enumerate(global_vertex_ids)}
+    local_faces = np.asarray(
+        [[remap[int(value)] for value in face] for face in source_faces],
+        dtype=np.int64,
+    )
+    local_vertices = np.asarray(mesh.vertices[global_vertex_ids], dtype=np.float64)
+    return local_vertices, local_faces, global_vertex_ids
+
+
+def _edge_use_table(faces: np.ndarray) -> dict[tuple[int, int], list[tuple[int, int]]]:
+    table: dict[tuple[int, int], list[tuple[int, int]]] = {}
+    for face_index, face in enumerate(np.asarray(faces, dtype=np.int64)):
+        ids = [int(value) for value in face]
+        for a, b in zip(ids, ids[1:] + ids[:1]):
+            table.setdefault(tuple(sorted((a, b))), []).append((int(a), int(b)))
+    return table
+
+
+def _boundary_vertex_mask(
+    vertex_count: int,
+    faces: np.ndarray,
+    rings: int,
+) -> np.ndarray:
+    """Lock interface vertices and optional neighbouring rings during reduction."""
+
+    table = _edge_use_table(faces)
+    locked = np.zeros(int(vertex_count), dtype=bool)
+    for edge, uses in table.items():
+        if len(uses) == 1:
+            locked[int(edge[0])] = True
+            locked[int(edge[1])] = True
+    if rings <= 0 or not np.any(locked):
+        return locked
+    adjacency: list[set[int]] = [set() for _ in range(int(vertex_count))]
+    for face in np.asarray(faces, dtype=np.int64):
+        ids = [int(value) for value in face]
+        for a, b in zip(ids, ids[1:] + ids[:1]):
+            adjacency[a].add(b)
+            adjacency[b].add(a)
+    frontier = set(np.flatnonzero(locked).tolist())
+    for _ in range(int(rings)):
+        following = set(frontier)
+        for vertex_id in frontier:
+            following.update(adjacency[int(vertex_id)])
+        locked[np.asarray(sorted(following), dtype=np.int64)] = True
+        frontier = following
+    return locked
+
+
+def _compact_triangle_mesh(
+    vertices: np.ndarray,
+    faces: np.ndarray,
+) -> tuple[np.ndarray, np.ndarray]:
+    """Drop degenerate/duplicate triangles and compact the vertex array."""
+
+    clean: list[list[int]] = []
+    seen: set[tuple[int, int, int]] = set()
+    for face in np.asarray(faces, dtype=np.int64):
+        ids = [int(value) for value in face]
+        if len(set(ids)) != 3:
+            continue
+        key = tuple(sorted(ids))
+        if key in seen:
+            continue
+        points = np.asarray(vertices, dtype=np.float64)[np.asarray(ids, dtype=np.int64)]
+        if float(np.linalg.norm(np.cross(points[1] - points[0], points[2] - points[0]))) <= 1e-14:
+            continue
+        seen.add(key)
+        clean.append(ids)
+    if not clean:
+        raise ValueError("Constrained simplification removed every source face")
+    clean_faces = np.asarray(clean, dtype=np.int64)
+    used = np.unique(clean_faces.reshape(-1))
+    remap = np.full(len(vertices), -1, dtype=np.int64)
+    remap[used] = np.arange(len(used), dtype=np.int64)
+    return np.asarray(vertices, dtype=np.float64)[used], remap[clean_faces]
+
+
+def _split_patch_vertex_fans(
+    vertices: np.ndarray,
+    faces: np.ndarray,
+) -> tuple[np.ndarray, np.ndarray, dict[str, int]]:
+    """Split pinched/non-manifold boundary vertices into manifold face fans.
+
+    A PartField union can have two otherwise valid boundary loops touching at a
+    single source vertex (for example where three labels meet).  The old V28
+    boundary walker treated that topological pinch as a branched loop and
+    aborted.  For paper geometry the correct operation is to duplicate the
+    shared coordinate once per disconnected incident face fan.  Geometry does
+    not move; only topology is separated so each boundary component becomes a
+    simple loop.
+    """
+
+    compact_vertices, compact_faces = _compact_triangle_mesh(vertices, faces)
+    vertices_array = np.asarray(compact_vertices, dtype=np.float64)
+    original_faces = np.asarray(compact_faces, dtype=np.int64)
+    remapped_faces = original_faces.copy()
+
+    incident: list[list[int]] = [[] for _ in range(len(vertices_array))]
+    edge_faces: dict[tuple[int, int], list[int]] = {}
+    for face_id, face in enumerate(original_faces):
+        ids = [int(value) for value in face]
+        for vertex_id in ids:
+            incident[vertex_id].append(int(face_id))
+        for a, b in zip(ids, ids[1:] + ids[:1]):
+            edge_faces.setdefault(tuple(sorted((a, b))), []).append(int(face_id))
+
+    output_vertices = [np.asarray(point, dtype=np.float64) for point in vertices_array]
+    split_vertex_count = 0
+    added_vertex_count = 0
+
+    for vertex_id, face_ids in enumerate(incident):
+        if len(face_ids) <= 1:
+            continue
+        parent = {int(face_id): int(face_id) for face_id in face_ids}
+
+        def find(face_id: int) -> int:
+            root = int(face_id)
+            while parent[root] != root:
+                root = parent[root]
+            while parent[int(face_id)] != int(face_id):
+                following = parent[int(face_id)]
+                parent[int(face_id)] = root
+                face_id = following
+            return root
+
+        def union(first: int, second: int) -> None:
+            root_a = find(int(first))
+            root_b = find(int(second))
+            if root_a != root_b:
+                parent[max(root_a, root_b)] = min(root_a, root_b)
+
+        # Faces belong to the same local fan only when they are connected by a
+        # regular two-use edge containing this vertex.  Boundary edges and
+        # over-used edges intentionally do not join fans.
+        neighbours: set[int] = set()
+        for face_id in face_ids:
+            face = original_faces[int(face_id)]
+            for other in face:
+                other_id = int(other)
+                if other_id != int(vertex_id):
+                    neighbours.add(other_id)
+        for other_id in neighbours:
+            uses = edge_faces.get(tuple(sorted((int(vertex_id), other_id))), [])
+            if len(uses) == 2:
+                union(int(uses[0]), int(uses[1]))
+
+        components: dict[int, list[int]] = {}
+        for face_id in face_ids:
+            components.setdefault(find(int(face_id)), []).append(int(face_id))
+        ordered_components = sorted(components.values(), key=lambda values: min(values))
+        if len(ordered_components) <= 1:
+            continue
+
+        split_vertex_count += 1
+        for component in ordered_components[1:]:
+            new_vertex_id = len(output_vertices)
+            output_vertices.append(vertices_array[int(vertex_id)].copy())
+            added_vertex_count += 1
+            for face_id in component:
+                positions = np.flatnonzero(remapped_faces[int(face_id)] == int(vertex_id))
+                remapped_faces[int(face_id), positions] = int(new_vertex_id)
+
+    final_vertices, final_faces = _compact_triangle_mesh(
+        np.asarray(output_vertices, dtype=np.float64),
+        remapped_faces,
+    )
+    return final_vertices, final_faces, {
+        "split_nonmanifold_vertex_count": int(split_vertex_count),
+        "added_topology_vertex_count": int(added_vertex_count),
+    }
+
+
+def _boundary_is_simple_loops(faces: np.ndarray) -> bool:
+    table = _edge_use_table(faces)
+    boundary_edges = [edge for edge, uses in table.items() if len(uses) == 1]
+    if not boundary_edges:
+        return True
+    degree: dict[int, int] = {}
+    for a, b in boundary_edges:
+        degree[int(a)] = degree.get(int(a), 0) + 1
+        degree[int(b)] = degree.get(int(b), 0) + 1
+    return all(value == 2 for value in degree.values())
+
+
+def _mesh_topology_is_safe(faces: np.ndarray, *, expect_boundary: bool) -> bool:
+    counts = [len(value) for value in _edge_use_table(faces).values()]
+    if not counts or max(counts) > 2:
+        return False
+    if expect_boundary:
+        return any(value == 1 for value in counts) and _boundary_is_simple_loops(faces)
+    return all(value == 2 for value in counts)
+
+
+def _cluster_patch_once(
+    vertices: np.ndarray,
+    faces: np.ndarray,
+    locked: np.ndarray,
+    resolution: int,
+) -> tuple[np.ndarray, np.ndarray]:
+    """Boundary-locked vertex clustering with representatives on the source mesh."""
+
+    vertices = np.asarray(vertices, dtype=np.float64)
+    faces = np.asarray(faces, dtype=np.int64)
+    bounds_min = vertices.min(axis=0)
+    extent = max(float(np.max(np.ptp(vertices, axis=0))), 1e-12)
+    cell = extent / max(int(resolution), 1)
+    groups: dict[tuple[object, ...], list[int]] = {}
+    for vertex_id, point in enumerate(vertices):
+        if bool(locked[int(vertex_id)]):
+            key: tuple[object, ...] = ("locked", int(vertex_id))
+        else:
+            grid = np.floor((point - bounds_min) / max(cell, 1e-15)).astype(np.int64)
+            key = ("cell", int(grid[0]), int(grid[1]), int(grid[2]))
+        groups.setdefault(key, []).append(int(vertex_id))
+
+    representatives: list[np.ndarray] = []
+    source_to_rep = np.empty(len(vertices), dtype=np.int64)
+    for member_ids in groups.values():
+        member_array = np.asarray(member_ids, dtype=np.int64)
+        points = vertices[member_array]
+        if len(member_ids) == 1 or bool(locked[int(member_ids[0])]):
+            representative = points[0]
+        else:
+            center = points.mean(axis=0)
+            # Choosing an existing source vertex prevents the familiar inward
+            # shrinkage of ordinary voxel averaging on round fruit surfaces.
+            representative = points[int(np.argmin(np.sum((points - center[None, :]) ** 2, axis=1)))]
+        rep_id = len(representatives)
+        representatives.append(np.asarray(representative, dtype=np.float64))
+        source_to_rep[member_array] = int(rep_id)
+
+    remapped = source_to_rep[faces]
+    compact_vertices, compact_faces = _compact_triangle_mesh(
+        np.asarray(representatives, dtype=np.float64), remapped
+    )
+    manifold_vertices, manifold_faces, _ = _split_patch_vertex_fans(
+        compact_vertices, compact_faces
+    )
+    return manifold_vertices, manifold_faces
+
+
+def _cyclic_loop_mapping(source_points: np.ndarray, candidate_points: np.ndarray) -> tuple[np.ndarray, float] | None:
+    """Map a candidate boundary loop to the source loop without changing topology."""
+
+    source_points = np.asarray(source_points, dtype=np.float64)
+    candidate_points = np.asarray(candidate_points, dtype=np.float64)
+    if len(source_points) != len(candidate_points) or len(source_points) < 3:
+        return None
+    best_order: np.ndarray | None = None
+    best_error = float("inf")
+    base = np.arange(len(candidate_points), dtype=np.int64)
+    for reverse in (False, True):
+        oriented = base[::-1] if reverse else base
+        for shift in range(len(oriented)):
+            order = np.roll(oriented, shift)
+            error = float(
+                np.sqrt(
+                    np.mean(
+                        np.sum(
+                            (candidate_points[order] - source_points) ** 2,
+                            axis=1,
+                        )
+                    )
+                )
+            )
+            if error < best_error:
+                best_error = error
+                best_order = order.copy()
+    if best_order is None:
+        return None
+    return best_order, best_error
+
+
+def _snap_boundary_loops_to_source(
+    source_vertices: np.ndarray,
+    source_faces: np.ndarray,
+    candidate_vertices: np.ndarray,
+    candidate_faces: np.ndarray,
+) -> tuple[np.ndarray, dict[str, object]] | None:
+    """Restore exact frozen-boundary coordinates after an otherwise valid QEM pass.
+
+    MeshLab's ``preserveboundary`` protects boundary topology but can move boundary
+    coordinates by a small amount when optimal placement is enabled.  Rejecting
+    that whole decimation caused dense unsimplified fallbacks.  We instead match
+    complete loops cyclically and snap only those boundary vertices back to the
+    immutable source coordinates.
+    """
+
+    source_loops = _boundary_loops_from_triangles(np.asarray(source_faces, dtype=np.int64))
+    candidate_loops = _boundary_loops_from_triangles(np.asarray(candidate_faces, dtype=np.int64))
+    if len(source_loops) != len(candidate_loops):
+        return None
+    if not source_loops:
+        return np.asarray(candidate_vertices, dtype=np.float64), {
+            "boundary_loop_count": 0,
+            "boundary_vertex_snap_count": 0,
+            "boundary_snap_max_error_before": 0.0,
+        }
+
+    source_vertices = np.asarray(source_vertices, dtype=np.float64)
+    candidate_vertices = np.asarray(candidate_vertices, dtype=np.float64).copy()
+    costs = np.full((len(source_loops), len(candidate_loops)), 1e12, dtype=np.float64)
+    mappings: dict[tuple[int, int], tuple[np.ndarray, float]] = {}
+    for source_id, source_loop in enumerate(source_loops):
+        source_points = source_vertices[np.asarray(source_loop, dtype=np.int64)]
+        source_center = source_points.mean(axis=0)
+        source_perimeter = float(
+            np.sum(np.linalg.norm(np.roll(source_points, -1, axis=0) - source_points, axis=1))
+        )
+        for candidate_id, candidate_loop in enumerate(candidate_loops):
+            if len(source_loop) != len(candidate_loop):
+                continue
+            candidate_points = candidate_vertices[np.asarray(candidate_loop, dtype=np.int64)]
+            mapping = _cyclic_loop_mapping(source_points, candidate_points)
+            if mapping is None:
+                continue
+            order, error = mapping
+            candidate_center = candidate_points.mean(axis=0)
+            candidate_perimeter = float(
+                np.sum(
+                    np.linalg.norm(
+                        np.roll(candidate_points, -1, axis=0) - candidate_points,
+                        axis=1,
+                    )
+                )
+            )
+            scale = max(source_perimeter, 1e-12)
+            costs[source_id, candidate_id] = (
+                error / scale
+                + float(np.linalg.norm(candidate_center - source_center)) / scale
+                + abs(candidate_perimeter - source_perimeter) / scale
+            )
+            mappings[(source_id, candidate_id)] = (order, error)
+
+    rows, columns = linear_sum_assignment(costs)
+    if len(rows) != len(source_loops):
+        return None
+    max_error = 0.0
+    snap_count = 0
+    for source_id, candidate_id in zip(rows.tolist(), columns.tolist()):
+        if costs[source_id, candidate_id] >= 1e11:
+            return None
+        source_loop = source_loops[int(source_id)]
+        candidate_loop = candidate_loops[int(candidate_id)]
+        order, error = mappings[(int(source_id), int(candidate_id))]
+        source_points = source_vertices[np.asarray(source_loop, dtype=np.int64)]
+        candidate_ids = np.asarray(candidate_loop, dtype=np.int64)[order]
+        candidate_vertices[candidate_ids] = source_points
+        max_error = max(max_error, float(error))
+        snap_count += int(len(candidate_ids))
+
+    return candidate_vertices, {
+        "boundary_loop_count": int(len(source_loops)),
+        "boundary_vertex_snap_count": int(snap_count),
+        "boundary_snap_max_error_before": float(max_error),
+    }
+
+
+def _pymeshlab_constrained_quadric_simplify(
+    vertices: np.ndarray,
+    faces: np.ndarray,
+    *,
+    target_faces: int,
+    expect_boundary: bool,
+) -> tuple[np.ndarray, np.ndarray, dict[str, object]] | None:
+    """Run several topology-checked MeshLab QEM attempts and restore exact joints.
+
+    The function is deliberately retry-oriented: unsupported filters, aggressive
+    targets, or one invalid topology result do not terminate the fit.  Every
+    candidate is compacted, manifold-repaired, topology-checked, and—when the
+    patch is open—its boundary loops are snapped back to the exact source loops.
+    """
+
+    try:
+        import pymeshlab  # type: ignore
+    except Exception:
+        return None
+
+    vertices = np.asarray(vertices, dtype=np.float64)
+    faces = np.asarray(faces, dtype=np.int64)
+    source_face_count = int(len(faces))
+    attempts: list[dict[str, object]] = []
+    valid: list[tuple[float, np.ndarray, np.ndarray, dict[str, object]]] = []
+    attempt_specs = [
+        (1.0, True, True, 0.30),
+        (1.5, True, False, 0.15),
+        (2.0, True, False, 0.00),
+        (1.0, False, False, 0.00),
+    ]
+
+    for multiplier, preserve_topology, optimal_placement, quality_threshold in attempt_specs:
+        requested = min(
+            max(4, int(round(float(target_faces) * float(multiplier)))),
+            max(4, source_face_count - 1),
+        )
+        attempt: dict[str, object] = {
+            "requested_faces": int(requested),
+            "preserve_topology": bool(preserve_topology),
+            "optimal_placement": bool(optimal_placement),
+            "quality_threshold": float(quality_threshold),
+        }
+        try:
+            mesh_set = pymeshlab.MeshSet()
+            mesh_set.add_mesh(
+                pymeshlab.Mesh(vertex_matrix=vertices, face_matrix=faces),
+                "constrained_surface",
+            )
+            kwargs = {
+                "targetfacenum": int(requested),
+                "qualitythr": float(quality_threshold),
+                "preserveboundary": bool(expect_boundary),
+                "boundaryweight": 1000.0,
+                "preservenormal": True,
+                "preservetopology": bool(preserve_topology),
+                "optimalplacement": bool(optimal_placement),
+                "planarquadric": False,
+                "qualityweight": False,
+                "autoclean": True,
+            }
+            try:
+                mesh_set.meshing_decimation_quadric_edge_collapse(**kwargs)
+            except AttributeError:
+                mesh_set.apply_filter("meshing_decimation_quadric_edge_collapse", **kwargs)
+            output = mesh_set.current_mesh()
+            candidate_vertices = np.asarray(output.vertex_matrix(), dtype=np.float64)
+            candidate_faces = np.asarray(output.face_matrix(), dtype=np.int64)
+            candidate_vertices, candidate_faces = _compact_triangle_mesh(
+                candidate_vertices, candidate_faces
+            )
+            candidate_vertices, candidate_faces, fan_metadata = _split_patch_vertex_fans(
+                candidate_vertices, candidate_faces
+            )
+            attempt["output_faces"] = int(len(candidate_faces))
+            attempt["fan_repair"] = fan_metadata
+            if len(candidate_faces) >= source_face_count:
+                attempt["accepted"] = False
+                attempt["reason"] = "no_face_reduction"
+                attempts.append(attempt)
+                continue
+            if not _mesh_topology_is_safe(candidate_faces, expect_boundary=expect_boundary):
+                attempt["accepted"] = False
+                attempt["reason"] = "unsafe_topology"
+                attempts.append(attempt)
+                continue
+            boundary_metadata: dict[str, object] = {}
+            if expect_boundary:
+                snapped = _snap_boundary_loops_to_source(
+                    vertices, faces, candidate_vertices, candidate_faces
+                )
+                if snapped is None:
+                    attempt["accepted"] = False
+                    attempt["reason"] = "boundary_loop_mismatch"
+                    attempts.append(attempt)
+                    continue
+                candidate_vertices, boundary_metadata = snapped
+                if not _mesh_topology_is_safe(candidate_faces, expect_boundary=True):
+                    attempt["accepted"] = False
+                    attempt["reason"] = "unsafe_after_boundary_snap"
+                    attempts.append(attempt)
+                    continue
+            relative = abs(len(candidate_faces) - target_faces) / max(target_faces, 1)
+            overflow = max(0, len(candidate_faces) - target_faces) / max(target_faces, 1)
+            score = float(relative + 0.35 * overflow)
+            attempt.update(boundary_metadata)
+            attempt["accepted"] = True
+            attempt["score"] = float(score)
+            attempts.append(attempt)
+            valid.append(
+                (
+                    score,
+                    candidate_vertices,
+                    candidate_faces,
+                    {
+                        "qem_attempts": attempts.copy(),
+                        "qem_selected_attempt": dict(attempt),
+                        **boundary_metadata,
+                    },
+                )
+            )
+        except Exception as error:
+            attempt["accepted"] = False
+            attempt["reason"] = f"{type(error).__name__}: {error}"
+            attempts.append(attempt)
+
+    if not valid:
+        return None
+    valid.sort(key=lambda item: (item[0], len(item[2])))
+    _, selected_vertices, selected_faces, metadata = valid[0]
+    metadata["qem_attempts"] = attempts
+    return selected_vertices, selected_faces, metadata
+
+def _constrained_vertex_cluster_simplify(
+    vertices: np.ndarray,
+    faces: np.ndarray,
+    *,
+    target_faces: int,
+    boundary_rings: int,
+    search_steps: int,
+    min_reduction_ratio: float,
+) -> tuple[np.ndarray, np.ndarray, dict[str, object]]:
+    """Reduce a source surface while freezing its physical attachment boundary.
+
+    Reduction is mandatory whenever a topology-safe reduced candidate exists.
+    The original dense patch is no longer allowed to beat a reduced candidate
+    merely because it is numerically closer to a difficult face budget.
+    """
+
+    vertices = np.asarray(vertices, dtype=np.float64)
+    faces = np.asarray(faces, dtype=np.int64)
+    source_face_count = int(len(faces))
+    original_table = _edge_use_table(faces)
+    expect_boundary = any(len(value) == 1 for value in original_table.values())
+    locked = _boundary_vertex_mask(len(vertices), faces, max(int(boundary_rings), 0))
+    target_faces = max(4, int(target_faces))
+    min_reduction_ratio = float(np.clip(min_reduction_ratio, 1e-6, 0.999999))
+    maximum_required_faces = max(
+        4,
+        int(np.floor(source_face_count * (1.0 - min_reduction_ratio))),
+    )
+    candidates: list[
+        tuple[float, np.ndarray, np.ndarray, int, str, dict[str, object]]
+    ] = []
+
+    qem_candidate = _pymeshlab_constrained_quadric_simplify(
+        vertices,
+        faces,
+        target_faces=target_faces,
+        expect_boundary=expect_boundary,
+    )
+    if qem_candidate is not None:
+        qem_vertices, qem_faces, qem_metadata = qem_candidate
+        face_count = len(qem_faces)
+        relative = abs(face_count - target_faces) / max(target_faces, 1)
+        overflow = max(0, face_count - target_faces) / max(target_faces, 1)
+        candidates.append(
+            (
+                float(relative + 0.35 * overflow),
+                qem_vertices,
+                qem_faces,
+                -1,
+                "pymeshlab_boundary_preserving_qem",
+                qem_metadata,
+            )
+        )
+
+    # Search from coarse to fine. Vertex clustering is intentionally kept as a
+    # dependency-free fallback for systems where MeshLab cannot load one plugin.
+    steps = max(6, int(search_steps))
+    resolutions = sorted(
+        set(
+            [1, 2, 3, 4]
+            + [int(round(value)) for value in np.geomspace(2.0, 512.0, steps)]
+        )
+    )
+    clustering_attempts: list[dict[str, object]] = []
+    for resolution in resolutions:
+        attempt: dict[str, object] = {"resolution": int(resolution)}
+        try:
+            candidate_vertices, candidate_faces = _cluster_patch_once(
+                vertices, faces, locked, int(resolution)
+            )
+        except ValueError as error:
+            attempt.update(
+                {"accepted": False, "reason": f"{type(error).__name__}: {error}"}
+            )
+            clustering_attempts.append(attempt)
+            continue
+        face_count = int(len(candidate_faces))
+        attempt["output_faces"] = face_count
+        if face_count >= source_face_count:
+            attempt.update({"accepted": False, "reason": "no_face_reduction"})
+            clustering_attempts.append(attempt)
+            continue
+        if not _mesh_topology_is_safe(candidate_faces, expect_boundary=expect_boundary):
+            attempt.update({"accepted": False, "reason": "unsafe_topology"})
+            clustering_attempts.append(attempt)
+            continue
+        relative = abs(face_count - target_faces) / max(target_faces, 1)
+        overflow = max(0, face_count - target_faces) / max(target_faces, 1)
+        score = float(relative + 0.35 * overflow)
+        attempt.update({"accepted": True, "score": score})
+        clustering_attempts.append(attempt)
+        candidates.append(
+            (
+                score,
+                candidate_vertices,
+                candidate_faces,
+                int(resolution),
+                "boundary_locked_source_vertex_clustering",
+                {},
+            )
+        )
+
+    reduced = [item for item in candidates if len(item[2]) < source_face_count]
+    budget_candidates = [
+        item for item in reduced if len(item[2]) <= maximum_required_faces
+    ]
+    mandatory_reduction_failed = False
+    minimum_reduction_relaxed = False
+    if budget_candidates:
+        pool = budget_candidates
+        pool.sort(key=lambda item: (item[0], len(item[2]), item[3]))
+        selected = pool[0]
+    elif reduced:
+        # A fixed seam can impose a higher topology-safe minimum than requested.
+        # Continue with the most reduced valid shell and record the relaxation.
+        minimum_reduction_relaxed = True
+        reduced.sort(key=lambda item: (len(item[2]), item[0], item[3]))
+        selected = reduced[0]
+    else:
+        # Last-resort continuity: never terminate the complete asset because one
+        # optional decimator failed to load. The unsimplified output is explicit
+        # and machine-readable rather than silently masquerading as success.
+        mandatory_reduction_failed = True
+        original_vertices, original_faces = _compact_triangle_mesh(vertices, faces)
+        selected = (
+            float("inf"),
+            original_vertices,
+            original_faces,
+            0,
+            "unsimplified_emergency_continuation",
+            {},
+        )
+        print(
+            "[PrimitiveFit][WARNING] no topology-safe reduced constrained-surface "
+            "candidate was available; continuing with the source patch",
+            flush=True,
+        )
+
+    (
+        _,
+        selected_vertices,
+        selected_faces,
+        selected_resolution,
+        selected_engine,
+        selected_metadata,
+    ) = selected
+    achieved_reduction = 1.0 - len(selected_faces) / max(source_face_count, 1)
+    return selected_vertices, selected_faces, {
+        "simplifier": str(selected_engine),
+        "source_outer_face_count": int(source_face_count),
+        "simplified_outer_face_count": int(len(selected_faces)),
+        "locked_vertex_count": int(np.count_nonzero(locked)),
+        "boundary_lock_rings": int(boundary_rings),
+        "selected_grid_resolution": int(selected_resolution),
+        "requested_outer_face_count": int(target_faces),
+        "required_minimum_reduction_ratio": float(min_reduction_ratio),
+        "achieved_reduction_ratio": float(achieved_reduction),
+        "mandatory_reduction_satisfied": bool(
+            len(selected_faces) <= maximum_required_faces
+        ),
+        "minimum_reduction_relaxed": bool(minimum_reduction_relaxed),
+        "mandatory_reduction_failed": bool(mandatory_reduction_failed),
+        "paper_face_budget_satisfied": bool(
+            len(selected_faces) <= max(int(target_faces * 1.5), int(target_faces) + 12)
+        ),
+        "pymeshlab_qem_candidate_available": bool(qem_candidate is not None),
+        "vertex_clustering_attempts": clustering_attempts,
+        **selected_metadata,
+    }
+
+def _boundary_loops_from_triangles(faces: np.ndarray) -> list[list[int]]:
+    """Return consistently ordered manifold boundary loops."""
+
+    table = _edge_use_table(faces)
+    boundary_undirected = [edge for edge, uses in table.items() if len(uses) == 1]
+    if not boundary_undirected:
+        return []
+    adjacency: dict[int, list[int]] = {}
+    directed = set()
+    for edge in boundary_undirected:
+        use = table[edge][0]
+        directed.add((int(use[0]), int(use[1])))
+        adjacency.setdefault(int(edge[0]), []).append(int(edge[1]))
+        adjacency.setdefault(int(edge[1]), []).append(int(edge[0]))
+    invalid = {
+        int(vertex_id): int(len(neighbours))
+        for vertex_id, neighbours in adjacency.items()
+        if len(neighbours) != 2
+    }
+    if invalid:
+        preview = sorted(invalid.items())[:12]
+        raise ValueError(
+            "Constrained surface boundary is not a collection of simple loops "
+            f"(invalid boundary degrees={preview}, total={len(invalid)})"
+        )
+
+    unused = {tuple(sorted(edge)) for edge in boundary_undirected}
+    loops: list[list[int]] = []
+    while unused:
+        first_edge = min(unused)
+        start, current = int(first_edge[0]), int(first_edge[1])
+        loop = [start, current]
+        unused.remove(first_edge)
+        previous = start
+        while current != start:
+            neighbours = adjacency[current]
+            following = neighbours[0] if neighbours[0] != previous else neighbours[1]
+            edge = tuple(sorted((current, following)))
+            if following == start:
+                if edge in unused:
+                    unused.remove(edge)
+                break
+            if edge not in unused:
+                raise ValueError("Constrained surface boundary loop self-intersects")
+            unused.remove(edge)
+            loop.append(int(following))
+            previous, current = current, int(following)
+        matching = sum(
+            (int(a), int(b)) in directed for a, b in zip(loop, loop[1:] + loop[:1])
+        )
+        if matching < len(loop) / 2:
+            loop.reverse()
+        loops.append(loop)
+    return loops
+
+
+def _interface_loop_assignment(
+    vertices: np.ndarray,
+    loops: Sequence[Sequence[int]],
+    interfaces: Sequence[_FrozenInterface],
+    model_extent: float,
+) -> tuple[dict[int, int], set[int]]:
+    """Match each immutable joint polygon to the closest source boundary loop."""
+
+    if not loops or not interfaces:
+        return {}, set(range(len(loops)))
+    costs = np.empty((len(interfaces), len(loops)), dtype=np.float64)
+    extent = max(float(model_extent), 1e-12)
+    for interface_id, interface in enumerate(interfaces):
+        normal = np.asarray(interface.normal_a_to_b, dtype=np.float64)
+        anchor = np.asarray(interface.anchor, dtype=np.float64)
+        source_points = np.asarray(interface.polygon_3d, dtype=np.float64)
+        for loop_id, loop in enumerate(loops):
+            points = np.asarray(vertices, dtype=np.float64)[np.asarray(loop, dtype=np.int64)]
+            plane_error = float(np.mean(np.abs((points - anchor[None, :]) @ normal))) / extent
+            center_error = float(np.linalg.norm(points.mean(axis=0) - anchor)) / extent
+            tree = cKDTree(points)
+            shape_error = float(np.mean(tree.query(source_points, k=1)[0])) / extent
+            costs[interface_id, loop_id] = 2.0 * plane_error + center_error + shape_error
+    rows, columns = linear_sum_assignment(costs)
+    assignment = {int(row): int(column) for row, column in zip(rows.tolist(), columns.tolist())}
+    unused = set(range(len(loops))) - set(assignment.values())
+    return assignment, unused
+
+
+def _cap_loop_with_fan(
+    vertices: np.ndarray,
+    polygons: list[list[int]],
+    loop: Sequence[int],
+) -> tuple[np.ndarray, list[int]]:
+    points = np.asarray(vertices, dtype=np.float64)[np.asarray(loop, dtype=np.int64)]
+    center_index = len(vertices)
+    vertices = np.vstack((np.asarray(vertices, dtype=np.float64), points.mean(axis=0)))
+    added: list[int] = []
+    ids = [int(value) for value in loop]
+    for a, b in zip(ids, ids[1:] + ids[:1]):
+        added.append(len(polygons))
+        polygons.append([int(a), int(b), int(center_index)])
+    return vertices, added
+
+
+
+
+def _loop_vertex_parameters(points: np.ndarray) -> np.ndarray:
+    points = np.asarray(points, dtype=np.float64)
+    if len(points) == 0:
+        return np.empty(0, dtype=np.float64)
+    lengths = np.linalg.norm(np.roll(points, -1, axis=0) - points, axis=1)
+    perimeter = max(float(np.sum(lengths)), 1e-12)
+    return np.concatenate(([0.0], np.cumsum(lengths[:-1]))) / perimeter
+
+
+def _collapse_patch_boundaries_to_interfaces(
+    vertices: np.ndarray,
+    faces: np.ndarray,
+    interfaces: Sequence[_FrozenInterface],
+    model_extent: float,
+) -> tuple[np.ndarray, np.ndarray, list[dict[str, object]], bool]:
+    """Replace only attachment loops by the immutable low-sided interface polygon.
+
+    This is the actual boundary constraint used by V28.  The outer patch keeps
+    its source vertices, while the high-resolution seam is collapsed onto the
+    same 3-12 sided polygon used by the adjacent closed primitive.  As a result,
+    simplification can reach a paper-friendly face budget without moving the
+    joint after fitting.
+    """
+
+    if not interfaces:
+        return (
+            np.asarray(vertices, dtype=np.float64),
+            np.asarray(faces, dtype=np.int64),
+            [],
+            False,
+        )
+    loops = _boundary_loops_from_triangles(faces)
+    assignment, _ = _interface_loop_assignment(vertices, loops, interfaces, model_extent)
+    if len(assignment) < len(interfaces):
+        return (
+            np.asarray(vertices, dtype=np.float64),
+            np.asarray(faces, dtype=np.int64),
+            [],
+            False,
+        )
+
+    expanded = np.asarray(vertices, dtype=np.float64).copy()
+    remap = np.arange(len(expanded), dtype=np.int64)
+    records: list[dict[str, object]] = []
+    for interface_id, loop_id in sorted(assignment.items()):
+        interface = interfaces[int(interface_id)]
+        loop = [int(value) for value in loops[int(loop_id)]]
+        source_points = expanded[np.asarray(loop, dtype=np.int64)]
+        fixed_points = _align_interface_loop(
+            source_points,
+            np.asarray(interface.polygon_3d, dtype=np.float64),
+        )
+        if len(loop) < len(fixed_points):
+            return (
+                np.asarray(vertices, dtype=np.float64),
+                np.asarray(faces, dtype=np.int64),
+                [],
+                False,
+            )
+        start = len(expanded)
+        expanded = np.vstack((expanded, fixed_points))
+        source_t = _loop_vertex_parameters(source_points)
+        fixed_t = _loop_vertex_parameters(fixed_points)
+        circular = np.abs(source_t[:, None] - fixed_t[None, :])
+        circular = np.minimum(circular, 1.0 - circular)
+        mapped = np.argmin(circular, axis=1).astype(np.int64)
+        # Guarantee that every corner of the immutable interface survives.
+        for fixed_id in range(len(fixed_points)):
+            if np.any(mapped == fixed_id):
+                continue
+            source_id = int(np.argmin(circular[:, fixed_id]))
+            mapped[source_id] = int(fixed_id)
+        remap[np.asarray(loop, dtype=np.int64)] = start + mapped
+        records.append(
+            {
+                "interface_index": int(interface_id),
+                "source_boundary_vertex_count": int(len(loop)),
+                "fixed_boundary_vertex_count": int(len(fixed_points)),
+                "source_boundary_collapsed": True,
+            }
+        )
+
+    remapped_faces = remap[np.asarray(faces, dtype=np.int64)]
+    try:
+        compact_vertices, compact_faces = _compact_triangle_mesh(expanded, remapped_faces)
+        compact_vertices, compact_faces, _ = _split_patch_vertex_fans(
+            compact_vertices, compact_faces
+        )
+    except ValueError:
+        return (
+            np.asarray(vertices, dtype=np.float64),
+            np.asarray(faces, dtype=np.int64),
+            [],
+            False,
+        )
+    if not _mesh_topology_is_safe(compact_faces, expect_boundary=True):
+        return (
+            np.asarray(vertices, dtype=np.float64),
+            np.asarray(faces, dtype=np.int64),
+            [],
+            False,
+        )
+    resulting_loops = _boundary_loops_from_triangles(compact_faces)
+    resulting_assignment, _ = _interface_loop_assignment(
+        compact_vertices, resulting_loops, interfaces, model_extent
+    )
+    if len(resulting_assignment) < len(interfaces):
+        return (
+            np.asarray(vertices, dtype=np.float64),
+            np.asarray(faces, dtype=np.int64),
+            [],
+            False,
+        )
+    tolerance = max(float(model_extent) * 1e-7, 1e-9)
+    for interface_id, loop_id in resulting_assignment.items():
+        actual = compact_vertices[np.asarray(resulting_loops[int(loop_id)], dtype=np.int64)]
+        expected = np.asarray(interfaces[int(interface_id)].polygon_3d, dtype=np.float64)
+        if len(actual) != len(expected) or _unordered_point_set_error(actual, expected) > tolerance:
+            return (
+                np.asarray(vertices, dtype=np.float64),
+                np.asarray(faces, dtype=np.int64),
+                [],
+                False,
+            )
+    return compact_vertices, compact_faces, records, True
+
+def _fit_constrained_surface_cluster(
+    mesh: trimesh.Trimesh,
+    face_ids: np.ndarray,
+    label_id: int,
+    total_area: float,
+    config: PrimitiveFitConfig,
+    rng: np.random.Generator,
+    *,
+    frozen_interfaces: Sequence[_FrozenInterface] = (),
+    model_extent: float = 1.0,
+) -> PrimitivePart:
+    """Preserve the source silhouette instead of replacing it with a closed primitive.
+
+    The source outer triangles are reduced by boundary-locked vertex clustering.
+    Existing source vertices are used as representatives, so round fruit does
+    not collapse toward a PCA ellipsoid.  Every remaining PartField attachment
+    boundary is then stitched to the exact immutable interface polygon.
+    """
+
+    face_ids = np.asarray(face_ids, dtype=np.int64)
+    source_area = float(np.sum(np.asarray(mesh.area_faces[face_ids], dtype=np.float64)))
+    source_center = np.average(
+        np.asarray(mesh.triangles_center[face_ids], dtype=np.float64),
+        axis=0,
+        weights=np.maximum(np.asarray(mesh.area_faces[face_ids], dtype=np.float64), 1e-15),
+    )
+    target_faces = (
+        int(config.target_faces)
+        if config.target_faces > 0
+        else _auto_target_faces(len(face_ids), config.max_faces)
+    )
+    target_faces = int(np.clip(target_faces, 6, config.max_faces))
+    local_vertices, local_faces, _ = _local_patch_mesh(mesh, face_ids)
+    local_vertices, local_faces, topology_repair_metadata = _split_patch_vertex_fans(
+        local_vertices, local_faces
+    )
+    (
+        local_vertices,
+        local_faces,
+        fixed_boundary_records,
+        fixed_boundaries_applied,
+    ) = _collapse_patch_boundaries_to_interfaces(
+        local_vertices,
+        local_faces,
+        frozen_interfaces,
+        model_extent,
+    )
+
+    # Weak/medium auto contacts are intentionally not frozen.  Close those open
+    # source seams before simplification so thousands of boundary vertices do not
+    # become immutable and defeat the paper-face budget.  The cap is internal and
+    # remains untextured after simplification.
+    pre_simplify_weak_caps = False
+    pre_simplify_weak_cap_loop_count = 0
+    if not frozen_interfaces:
+        try:
+            open_loops = _boundary_loops_from_triangles(local_faces)
+        except ValueError:
+            open_loops = []
+        if open_loops:
+            cap_polygons: list[list[int]] = [list(map(int, face)) for face in local_faces]
+            cap_vertices = np.asarray(local_vertices, dtype=np.float64)
+            for loop in open_loops:
+                cap_vertices, _ = _cap_loop_with_fan(cap_vertices, cap_polygons, loop)
+            local_vertices = np.asarray(cap_vertices, dtype=np.float64)
+            local_faces = triangulate_polygons(cap_polygons)
+            pre_simplify_weak_caps = True
+            pre_simplify_weak_cap_loop_count = int(len(open_loops))
+
+    simplified_vertices, simplified_faces, simplify_metadata = _constrained_vertex_cluster_simplify(
+        local_vertices,
+        local_faces,
+        target_faces=target_faces,
+        boundary_rings=config.surface_boundary_rings,
+        search_steps=config.surface_search_steps,
+        min_reduction_ratio=config.surface_min_reduction_ratio,
+    )
+
+    hard_max_faces = max(int(config.surface_hard_max_faces), int(config.max_faces), 6)
+    hard_cap_fallback = "none"
+    if len(simplified_faces) > hard_max_faces and not frozen_interfaces:
+        # Last-resort source-derived fallback: a support-point convex hull is far
+        # closer to the original placement and proportions than an arbitrary PCA
+        # ellipsoid, while providing a strict paper-face ceiling.
+        try:
+            direction_count = max(12, min(192, hard_max_faces // 2))
+            hard_candidate = _convex_candidate(
+                np.asarray(local_vertices, dtype=np.float64),
+                hard_max_faces,
+                direction_count,
+            )
+            if hard_candidate.face_count <= hard_max_faces:
+                simplified_vertices = np.asarray(hard_candidate.vertices, dtype=np.float64)
+                simplified_faces = triangulate_polygons(hard_candidate.polygons)
+                hard_cap_fallback = "source_support_convex_hull"
+        except (ValueError, QhullError, np.linalg.LinAlgError):
+            pass
+    simplify_metadata.update(
+        {
+            "surface_hard_max_faces": int(hard_max_faces),
+            "surface_hard_face_cap_satisfied": bool(len(simplified_faces) <= hard_max_faces),
+            "surface_hard_cap_fallback": str(hard_cap_fallback),
+            "pre_simplify_weak_contact_caps": bool(pre_simplify_weak_caps),
+            "pre_simplify_weak_contact_cap_loop_count": int(pre_simplify_weak_cap_loop_count),
+        }
+    )
+    vertices = np.asarray(simplified_vertices, dtype=np.float64)
+    polygons: list[list[int]] = [list(map(int, face)) for face in simplified_faces]
+    loops = _boundary_loops_from_triangles(simplified_faces)
+    assignment, unused_loops = _interface_loop_assignment(
+        vertices, loops, frozen_interfaces, model_extent
+    )
+    face_indices: dict[str, int] = {}
+    interface_areas: dict[str, float] = {}
+    untextured_faces: list[int] = []
+    interface_records: list[dict[str, object]] = []
+
+    for interface_id, loop_id in sorted(assignment.items()):
+        interface = frozen_interfaces[int(interface_id)]
+        source_loop = [int(value) for value in loops[int(loop_id)]]
+        source_points = vertices[np.asarray(source_loop, dtype=np.int64)]
+        if fixed_boundaries_applied:
+            interface_points = source_points
+            interface_loop = source_loop
+            cap_index = len(polygons)
+            polygons.append(interface_loop)
+        else:
+            interface_points = _align_interface_loop(
+                source_points, np.asarray(interface.polygon_3d, dtype=np.float64)
+            )
+            start = len(vertices)
+            vertices = np.vstack((vertices, interface_points))
+            interface_loop = list(range(start, start + len(interface_points)))
+            polygons.extend(_zipper_strip(source_loop, interface_loop))
+            cap_index = len(polygons)
+            polygons.append(interface_loop)
+        neighbour = int(
+            interface.segment_b if int(label_id) == int(interface.segment_a) else interface.segment_a
+        )
+        face_indices[str(neighbour)] = int(cap_index)
+        interface_areas[str(neighbour)] = float(_polygon_area_3d(interface_points))
+        untextured_faces.append(int(cap_index))
+        interface_records.append(
+            {
+                "neighbor_segment_id": int(neighbour),
+                "source_boundary_vertex_count": int(len(source_loop)),
+                "fixed_interface_vertex_count": int(len(interface_loop)),
+                "fixed_interface_face_index": int(cap_index),
+            }
+        )
+
+    # A disconnected/filtered source boundary has no physical neighbour.  Seal
+    # it locally so the exported part remains a valid independent paper shell.
+    fallback_cap_faces: list[int] = []
+    for loop_id in sorted(unused_loops):
+        vertices, added = _cap_loop_with_fan(vertices, polygons, loops[int(loop_id)])
+        fallback_cap_faces.extend(int(value) for value in added)
+        untextured_faces.extend(int(value) for value in added)
+
+    if len(assignment) < len(frozen_interfaces):
+        raise ValueError(
+            f"Constrained surface segment {label_id} has {len(frozen_interfaces)} fixed interfaces "
+            f"but only {len(assignment)} source boundary loops"
+        )
+
+    candidate = _canonical_interface_adapter_candidate(
+        "constrained_surface",
+        vertices,
+        polygons,
+        type_penalty=0.0,
+        metadata={
+            "fitting_strategy": "constrained_mesh_simplification",
+            "surface_fit_solver": str(simplify_metadata.get("simplifier", "unknown")),
+            "frozen_interface_face_indices": face_indices,
+            "frozen_interface_areas": interface_areas,
+            "frozen_interface_neighbors": sorted(int(value) for value in map(int, face_indices)),
+            "untextured_contact_face_indices": sorted(set(untextured_faces)),
+            "surface_interface_adapters": interface_records,
+            "surface_fallback_cap_face_indices": fallback_cap_faces,
+            "fixed_boundary_collapse_applied": bool(fixed_boundaries_applied),
+            "fixed_boundary_collapse_records": fixed_boundary_records,
+            "source_patch_topology_repair": topology_repair_metadata,
+            **simplify_metadata,
+        },
+    )
+
+    triangles = np.asarray(mesh.triangles[face_ids], dtype=np.float64)
+    areas = np.asarray(mesh.area_faces[face_ids], dtype=np.float64)
+    source_points = _sample_triangles(triangles, areas, config.fit_samples, rng)
+    source_tree = cKDTree(source_points)
+    _score_candidate(
+        candidate,
+        source_points,
+        source_tree,
+        _hull_volume(source_points),
+        target_faces,
+        max(config.max_faces, candidate.face_count),
+        config.fit_samples,
+        config.complexity_weight,
+        rng,
+    )
+    return PrimitivePart(
+        name=f"part_{int(label_id):02d}",
+        segment_id=int(label_id),
+        vertices=np.asarray(candidate.vertices, dtype=np.float64),
+        polygons=[list(face) for face in candidate.polygons],
+        source_face_count=int(len(face_ids)),
+        source_surface_area=float(source_area),
+        source_center=np.asarray(source_center, dtype=np.float64),
+        primitive_type="constrained_surface",
+        target_face_count=int(target_faces),
+        fit_score=float(candidate.score),
+        metadata={
+            "area_ratio": float(source_area / max(total_area, 1e-12)),
+            "selected_metrics": candidate.metrics,
+            "selected_candidate_metadata": candidate.metadata,
+            "candidate_count": 1,
+            "top_candidates": [
+                {
+                    "primitive_type": "constrained_surface",
+                    "paper_face_count": int(candidate.face_count),
+                    "score": float(candidate.score),
+                    "metrics": candidate.metrics,
+                    "metadata": candidate.metadata,
+                }
+            ],
+            "source_convex_hull_volume": float(_hull_volume(source_points)),
+            "paper_safe": True,
+            "closed_shell": True,
+            "shared_geometry_vertices": True,
+            "fitting_strategy": "constrained_mesh_simplification",
+            "surface_fit_solver": str(simplify_metadata.get("simplifier", "unknown")),
+            "frozen_interface_face_indices": face_indices,
+            "frozen_interface_areas": interface_areas,
+            "frozen_interface_neighbors": sorted(int(value) for value in map(int, face_indices)),
+            "untextured_contact_face_indices": sorted(set(untextured_faces)),
+            "source_surface_geometry_preserved": True,
+            "pca_primitive_replacement_applied": False,
+            "fixed_boundary_collapse_applied": bool(fixed_boundaries_applied),
+            "fixed_boundary_collapse_records": fixed_boundary_records,
+            "source_patch_topology_repair": topology_repair_metadata,
+            **simplify_metadata,
+        },
+    )
+
+
+def _surface_fit_group_ids(
+    mesh: trimesh.Trimesh,
+    cluster_faces: dict[int, np.ndarray],
+    group_members: dict[int, list[int]],
+    config: PrimitiveFitConfig,
+    total_area: float,
+    source_contacts: dict[tuple[int, int], _SourceContact],
+) -> set[int]:
+    """Select only the main body for constrained fitting; appendages stay closed primitives."""
+
+    mode = str(config.part_mode).strip().lower()
+    if mode == "closed" or not cluster_faces:
+        return set()
+    areas = {
+        int(segment_id): float(np.sum(mesh.area_faces[np.asarray(face_ids, dtype=np.int64)]))
+        for segment_id, face_ids in cluster_faces.items()
+    }
+    result = {
+        int(segment_id)
+        for segment_id, members in group_members.items()
+        if len(members) > 1
+    }
+    largest = max(areas, key=areas.get)
+    largest_ratio = areas[largest] / max(float(total_area), 1e-15)
+    largest_shape = _segment_patch_shape_metrics(mesh, cluster_faces[largest])
+    largest_is_appendage = (
+        largest_shape["secondary_axis_ratio"] < 0.28
+        or largest_shape["thickness_axis_ratio"] < 0.075
+    )
+    largest_has_attachment = any(int(largest) in pair for pair in source_contacts)
+    if (
+        largest_ratio >= float(config.surface_main_body_min_area_ratio)
+        and not largest_is_appendage
+        and largest_has_attachment
+    ):
+        result.add(int(largest))
+    if mode == "surface-patch":
+        for segment_id, area in areas.items():
+            shape = _segment_patch_shape_metrics(mesh, cluster_faces[segment_id])
+            appendage = (
+                shape["secondary_axis_ratio"] < 0.24
+                or shape["thickness_axis_ratio"] < 0.06
+            )
+            has_attachment = any(int(segment_id) in pair for pair in source_contacts)
+            if (
+                area / max(float(total_area), 1e-15) >= 0.18
+                and not appendage
+                and has_attachment
+            ):
+                result.add(int(segment_id))
+    return result
+
 def fit_primitives_from_labels(
     mesh: trimesh.Trimesh,
     labels: np.ndarray,
     config: PrimitiveFitConfig,
 ) -> list[PrimitivePart]:
-    """Fit one automatically selected closed paper primitive per PartField label."""
+    """Build hybrid paper parts from PartField surface labels.
+
+    Main-body surface groups use boundary-constrained source-mesh reduction;
+    appendages keep the closed primitive fitting path.  ``part_mode=closed``
+    preserves the V26/V27 one-label-one-primitive behaviour.
+    """
 
     labels = np.asarray(labels).reshape(-1).astype(np.int64)
     if len(labels) != len(mesh.faces):
@@ -3201,8 +5609,9 @@ def fit_primitives_from_labels(
         raise ValueError("primitive fit_samples must be >= 128")
     if config.contact_overlap_ratio < 0.0:
         raise ValueError("primitive contact_overlap_ratio must be >= 0")
-    if str(config.contact_mode).strip().lower() not in {"fixed", "connector", "move"}:
-        raise ValueError("primitive contact_mode must be fixed, connector, or move")
+    contact_mode = str(config.contact_mode).strip().lower()
+    if contact_mode not in {"auto", "fixed", "connector", "move"}:
+        raise ValueError("primitive contact_mode must be auto, fixed, connector, or move")
     if config.connector_sides < 3 or config.connector_sides > 12:
         raise ValueError("primitive connector_sides must be between 3 and 12")
     if config.connector_radius_ratio <= 0.0:
@@ -3217,6 +5626,39 @@ def fit_primitives_from_labels(
         raise ValueError("primitive interface_min_width_ratio must be > 0")
     if config.interface_plane_tolerance_ratio <= 0.0:
         raise ValueError("primitive interface_plane_tolerance_ratio must be > 0")
+    part_mode = str(config.part_mode).strip().lower()
+    validation_policy = str(config.validation_policy).strip().lower()
+    if part_mode not in {"auto", "closed", "surface-patch"}:
+        raise ValueError("primitive part_mode must be auto, closed, or surface-patch")
+    if config.patch_min_segment_area_ratio <= 0.0:
+        raise ValueError("primitive patch_min_segment_area_ratio must be > 0")
+    if not 0.0 < config.patch_min_area_balance <= 1.0:
+        raise ValueError("primitive patch_min_area_balance must be in (0, 1]")
+    if config.patch_min_interface_area_ratio <= 0.0:
+        raise ValueError("primitive patch_min_interface_area_ratio must be > 0")
+    if config.patch_min_seam_length_ratio <= 0.0:
+        raise ValueError("primitive patch_min_seam_length_ratio must be > 0")
+    if not 0.0 < config.surface_main_body_min_area_ratio <= 1.0:
+        raise ValueError("primitive surface_main_body_min_area_ratio must be in (0, 1]")
+    if config.surface_boundary_rings < 0 or config.surface_boundary_rings > 4:
+        raise ValueError("primitive surface_boundary_rings must be between 0 and 4")
+    if config.surface_search_steps < 6:
+        raise ValueError("primitive surface_search_steps must be >= 6")
+    if not 0.0 < config.surface_min_reduction_ratio < 1.0:
+        raise ValueError("primitive surface_min_reduction_ratio must be in (0, 1)")
+    if config.surface_hard_max_faces < 6:
+        raise ValueError("primitive surface_hard_max_faces must be >= 6")
+    if not 0.0 <= config.contact_weak_threshold < config.contact_strong_threshold <= 1.0:
+        raise ValueError(
+            "primitive contact thresholds must satisfy 0 <= weak < strong <= 1"
+        )
+    if config.contact_min_edge_count < 1:
+        raise ValueError("primitive contact_min_edge_count must be >= 1")
+    if str(config.contact_medium_mode).strip().lower() not in {"connector", "separate"}:
+        raise ValueError("primitive contact_medium_mode must be connector or separate")
+    validation_policy = str(config.validation_policy).strip().lower()
+    if validation_policy not in {"strict", "repair", "warn"}:
+        raise ValueError("primitive validation_policy must be strict, repair, or warn")
     allowed = set(config.allowed_types)
     valid_types = {"box", "prism", "frustum", "cone", "ellipsoid", "convex"}
     if not allowed or not allowed.issubset(valid_types):
@@ -3237,29 +5679,74 @@ def fit_primitives_from_labels(
     if not cluster_faces:
         raise ValueError("No primitive parts survived the segment filters")
 
-    valid_segment_ids = set(cluster_faces)
-    source_contacts = _source_label_contacts(mesh, labels, valid_segment_ids)
-    source_adjacency_pairs = set(source_contacts)
     model_extent = max(float(np.max(np.ptp(np.asarray(mesh.vertices), axis=0))), 1e-8)
-    fixed_mode = bool(
-        config.preserve_contacts and str(config.contact_mode).strip().lower() == "fixed"
+    grouped_labels, cluster_faces, group_members, grouping_decisions = _build_hybrid_segment_groups(
+        mesh,
+        labels,
+        cluster_faces,
+        config,
+        model_extent=model_extent,
+        total_area=total_area,
     )
-    frozen_interfaces = (
+    valid_segment_ids = set(cluster_faces)
+    source_contacts = _source_label_contacts(mesh, grouped_labels, valid_segment_ids)
+    source_adjacency_pairs = set(source_contacts)
+    contact_mode = str(config.contact_mode).strip().lower()
+    build_interface_geometry = bool(
+        config.preserve_contacts and contact_mode in {"fixed", "auto"}
+    )
+    all_frozen_interfaces = (
         _build_frozen_interfaces(
             source_contacts,
             model_extent=model_extent,
             max_sides=config.interface_max_sides,
             min_width_ratio=config.interface_min_width_ratio,
         )
-        if fixed_mode
+        if build_interface_geometry
         else {}
     )
+    contact_strengths: dict[tuple[int, int], _ContactStrength] = {}
+    if config.preserve_contacts and contact_mode == "auto":
+        contact_strengths = _classify_contact_strengths(
+            mesh, cluster_faces, source_contacts, all_frozen_interfaces, config
+        )
+        frozen_interfaces = {
+            pair: interface
+            for pair, interface in all_frozen_interfaces.items()
+            if contact_strengths.get(pair) is not None
+            and contact_strengths[pair].classification == "strong"
+        }
+    else:
+        frozen_interfaces = all_frozen_interfaces
+    fixed_mode = bool(config.preserve_contacts and contact_mode == "fixed")
+    auto_mode = bool(config.preserve_contacts and contact_mode == "auto")
+    strong_contact_pairs = {
+        pair for pair, item in contact_strengths.items() if item.classification == "strong"
+    }
+    weak_contact_pairs = {
+        pair for pair, item in contact_strengths.items() if item.classification == "weak"
+    }
     interfaces_by_segment: dict[int, list[_FrozenInterface]] = {
         segment_id: [] for segment_id in valid_segment_ids
     }
     for interface in frozen_interfaces.values():
         interfaces_by_segment[interface.segment_a].append(interface)
         interfaces_by_segment[interface.segment_b].append(interface)
+
+    surface_fit_ids = _surface_fit_group_ids(
+        mesh,
+        cluster_faces,
+        group_members,
+        config,
+        total_area,
+        source_contacts,
+    )
+    if surface_fit_ids:
+        print(
+            "[PrimitiveHybrid] constrained surface groups="
+            f"{sorted(int(value) for value in surface_fit_ids)}",
+            flush=True,
+        )
 
     rng = np.random.default_rng(config.seed)
     parts: list[PrimitivePart] = []
@@ -3269,24 +5756,186 @@ def fit_primitives_from_labels(
             f"target={'auto' if config.target_faces <= 0 else config.target_faces}",
             flush=True,
         )
-        part = _fit_one_cluster(
-            mesh,
-            face_ids,
-            int(label_id),
-            total_area,
-            config,
-            rng,
-            frozen_interfaces=interfaces_by_segment.get(int(label_id), ()),
-            model_extent=model_extent,
+        requested_surface_fit = bool(int(label_id) in surface_fit_ids)
+        fit_warnings: list[str] = []
+        try:
+            if requested_surface_fit:
+                part = _fit_constrained_surface_cluster(
+                    mesh,
+                    face_ids,
+                    int(label_id),
+                    total_area,
+                    config,
+                    rng,
+                    frozen_interfaces=interfaces_by_segment.get(int(label_id), ()),
+                    model_extent=model_extent,
+                )
+            else:
+                part = _fit_one_cluster(
+                    mesh,
+                    face_ids,
+                    int(label_id),
+                    total_area,
+                    config,
+                    rng,
+                    frozen_interfaces=interfaces_by_segment.get(int(label_id), ()),
+                    model_extent=model_extent,
+                )
+        except (ValueError, QhullError, np.linalg.LinAlgError) as first_error:
+            if validation_policy == "strict":
+                raise
+            fit_warnings.append(f"primary_fit: {type(first_error).__name__}: {first_error}")
+            print(
+                "[PrimitiveFit][WARNING] primary fit failed for "
+                f"segment={int(label_id)}; trying resilient fallbacks: {first_error}",
+                flush=True,
+            )
+            part = None
+            # Preserve the source shape first, even when an attachment boundary
+            # is too irregular to map to the canonical interface in one pass.
+            if requested_surface_fit:
+                try:
+                    part = _fit_constrained_surface_cluster(
+                        mesh,
+                        face_ids,
+                        int(label_id),
+                        total_area,
+                        config,
+                        rng,
+                        frozen_interfaces=(),
+                        model_extent=model_extent,
+                    )
+                    fit_warnings.append(
+                        "surface_fit_retried_without_fixed_interfaces; contact repaired later"
+                    )
+                except (ValueError, QhullError, np.linalg.LinAlgError) as error:
+                    fit_warnings.append(
+                        f"surface_without_interfaces: {type(error).__name__}: {error}"
+                    )
+            # Fall back to the established closed primitive path.  Fixed
+            # interfaces are attempted once more before allowing the contact
+            # stage to add a connector.
+            if part is None:
+                for keep_interfaces in (True, False):
+                    try:
+                        part = _fit_one_cluster(
+                            mesh,
+                            face_ids,
+                            int(label_id),
+                            total_area,
+                            config,
+                            rng,
+                            frozen_interfaces=(
+                                interfaces_by_segment.get(int(label_id), ())
+                                if keep_interfaces
+                                else ()
+                            ),
+                            model_extent=model_extent,
+                        )
+                        fit_warnings.append(
+                            "closed_primitive_fallback_with_interfaces"
+                            if keep_interfaces
+                            else "closed_primitive_fallback_without_interfaces"
+                        )
+                        break
+                    except (ValueError, QhullError, np.linalg.LinAlgError) as error:
+                        fit_warnings.append(
+                            f"closed_fallback_{keep_interfaces}: {type(error).__name__}: {error}"
+                        )
+            if part is None:
+                # This indicates corrupt input or an implementation defect, not
+                # an ordinary geometry ambiguity; retain a clear terminal error.
+                raise ValueError(
+                    f"All resilient fit strategies failed for segment {label_id}: "
+                    + " | ".join(fit_warnings)
+                )
+            part.metadata["fit_fallback_used"] = True
+            part.metadata["fit_fallback_warnings"] = fit_warnings
+
+        hard_face_limit = max(int(config.surface_hard_max_faces), int(config.max_faces), 6)
+        if part.primitive_type == "constrained_surface" and part.face_count > hard_face_limit:
+            dense_surface_part = part
+            hard_cap_errors: list[str] = []
+            replacement = None
+            for keep_interfaces in (True, False):
+                try:
+                    replacement = _fit_one_cluster(
+                        mesh,
+                        face_ids,
+                        int(label_id),
+                        total_area,
+                        config,
+                        rng,
+                        frozen_interfaces=(
+                            interfaces_by_segment.get(int(label_id), ()) if keep_interfaces else ()
+                        ),
+                        model_extent=model_extent,
+                    )
+                    break
+                except (ValueError, QhullError, np.linalg.LinAlgError) as error:
+                    hard_cap_errors.append(
+                        f"closed_hard_cap_{keep_interfaces}: {type(error).__name__}: {error}"
+                    )
+            if replacement is not None:
+                replacement.metadata.update(
+                    {
+                        "surface_hard_cap_fallback_used": True,
+                        "surface_hard_cap_original_primitive_type": "constrained_surface",
+                        "surface_hard_cap_original_face_count": int(dense_surface_part.face_count),
+                        "surface_hard_max_faces": int(hard_face_limit),
+                        "surface_hard_cap_fallback_errors": hard_cap_errors,
+                        "source_shape_preserving_surface_fit_failed_budget": True,
+                    }
+                )
+                part = replacement
+                print(
+                    "[PrimitiveFit][WARNING] constrained surface exceeded hard face cap "
+                    f"segment={int(label_id)} faces={dense_surface_part.face_count} "
+                    f"limit={hard_face_limit}; using {part.primitive_type} with {part.face_count} faces",
+                    flush=True,
+                )
+            else:
+                dense_surface_part.metadata.update(
+                    {
+                        "surface_hard_cap_fallback_used": False,
+                        "surface_hard_cap_fallback_errors": hard_cap_errors,
+                        "surface_hard_cap_unresolved": True,
+                    }
+                )
+        members = group_members.get(int(label_id), [int(label_id)])
+        internal_decisions = [
+            record
+            for record in grouping_decisions
+            if bool(record.get("merge"))
+            and int(record["segments"][0]) in members
+            and int(record["segments"][1]) in members
+        ]
+        part.metadata.update(
+            {
+                "primitive_part_mode": part_mode,
+                "source_segment_ids": [int(value) for value in members],
+                "surface_patch_group": bool(len(members) > 1),
+                "surface_patch_group_size": int(len(members)),
+                "surface_patch_internal_seams_removed": internal_decisions,
+                "hybrid_grouping_decisions": grouping_decisions,
+                "constrained_surface_fit": bool(int(label_id) in surface_fit_ids),
+            }
         )
+        simplifier_note = ""
+        if part.primitive_type == "constrained_surface":
+            simplifier_note = (
+                f" simplifier={part.metadata.get('simplifier', 'unknown')}"
+                f" budget_ok={part.metadata.get('paper_face_budget_satisfied')}"
+            )
         print(
             f"[PrimitiveFit] segment={int(label_id)} selected={part.primitive_type} "
-            f"paper_faces={part.face_count} score={part.fit_score:.6f}",
+            f"paper_faces={part.face_count} score={part.fit_score:.6f} "
+            f"source_segments={members}{simplifier_note}",
             flush=True,
         )
         parts.append(part)
 
-    if config.resolve_overlaps and not fixed_mode:
+    if config.resolve_overlaps and not fixed_mode and not auto_mode:
         # Source-adjacent labels are intentionally exempt from separation: they
         # must remain available as joints in the final paper assembly.
         _resolve_primitive_overlaps(
@@ -3294,7 +5943,7 @@ def fit_primitives_from_labels(
             config.overlap_gap_ratio,
             protected_pairs=source_adjacency_pairs,
         )
-    elif fixed_mode:
+    elif fixed_mode or auto_mode:
         # Scaling or translating a constrained part would alter its immutable
         # interface.  Report non-neighbour overlaps instead of corrupting joints.
         tolerance = model_extent * 1e-6
@@ -3308,7 +5957,8 @@ def fit_primitives_from_labels(
                     unresolved.append([int(part_a.segment_id), int(part_b.segment_id)])
         for part in parts:
             part.metadata["overlap_resolution_enabled"] = False
-            part.metadata["overlap_resolution_skipped_for_frozen_interfaces"] = True
+            part.metadata["overlap_resolution_skipped_for_frozen_interfaces"] = bool(fixed_mode)
+            part.metadata["overlap_resolution_deferred_to_contact_strength"] = bool(auto_mode)
             part.metadata["unresolved_overlap_pairs"] = unresolved
             part.metadata["nonoverlap_constraint_satisfied"] = not unresolved
     else:
@@ -3323,6 +5973,7 @@ def fit_primitives_from_labels(
             source_contacts,
             config,
             frozen_interfaces=frozen_interfaces,
+            contact_strengths=contact_strengths,
         )
     else:
         contact_records = []

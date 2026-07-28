@@ -1,4 +1,4 @@
-# Hunyuan3D → PartField → FitOBJ 分阶段运行说明（V25）
+# Hunyuan3D → PartField → FitOBJ 分阶段运行说明（V30）
 
 本说明用于将当前流水线拆成三个可独立重复执行的阶段：
 
@@ -23,7 +23,7 @@ AABB 或 Primitive Paper Model
 ```bash
 conda activate partfield
 
-cd /mnt/e/yp/partfield_hunyuan_v25
+cd /mnt/e/yp/partfield_hunyuan_v30
 python -m pip install -r requirements_wrapper.txt
 python -m pip install -e .
 ```
@@ -31,7 +31,7 @@ python -m pip install -e .
 设置本次狐狸模型使用的公共变量：
 
 ```bash
-export PROJECT=/mnt/e/yp/partfield_hunyuan_v25
+export PROJECT=/mnt/e/yp/partfield_hunyuan_v30
 export HUNYUAN_REPO=/mnt/e/yp/Hunyuan3D-2
 export PARTFIELD_REPO=/mnt/e/yp/PartField
 export CHECKPOINT=/mnt/e/yp/PartField/model/model_objaverse.ckpt
@@ -464,7 +464,7 @@ python -m partfield_mc.cli \
 Stage 1 和 Stage 2 成功后，后续修改拟合代码或参数只需：
 
 ```bash
-cd /mnt/e/yp/partfield_hunyuan_v25
+cd /mnt/e/yp/partfield_hunyuan_v30
 python -m pip install -e .
 
 export WORK=$PWD/fox_stages
@@ -523,3 +523,116 @@ _08.npy
 Paper Model 展开：paper_model.obj
 ```
 
+
+---
+
+# V27 Hybrid Primitive 补充
+
+苹果等连续主体推荐在 FitOBJ 阶段增加：
+
+```bash
+--fit-mode primitive \
+--primitive-part-mode auto \
+--primitive-contact-mode fixed
+```
+
+狐狸需要完全保持 V26 的“一条 PartField label 对应一个独立闭合壳体”时使用：
+
+```bash
+--fit-mode primitive \
+--primitive-part-mode closed \
+--primitive-contact-mode fixed
+```
+
+`auto` 不会修改 Hunyuan3D 或 PartField 的结果。它只在 FitOBJ 开始前，根据公共边界面积、边界长度、两侧面积比例以及部件细长度，决定哪些 PartField labels 是同一主体的表面分区，并在拟合前将它们合并。
+
+---
+
+# V28：Stage 3 混合拟合参数
+
+V28 的 Hunyuan3D 和 PartField 阶段不变。只需升级代码后重新执行 Stage 3 FitOBJ。
+
+## 苹果或连续主体
+
+```bash
+python -m partfield_mc.cli \
+  "$SOURCE_GLB" \
+  -o apple_primitive_v28 \
+  --postprocess-only \
+  --normalized-mesh "$NORMALIZED_MESH" \
+  --labels "$LABELS" \
+  --clusters 3 \
+  --category generic \
+  --up-axis y \
+  --forward-axis auto \
+  --fit-mode primitive \
+  --primitive-part-mode auto \
+  --obj-mode surface \
+  --primitive-types ellipsoid,convex,frustum,cone,prism \
+  --primitive-target-faces 0 \
+  --primitive-max-faces 72 \
+  --primitive-max-sides 24 \
+  --primitive-fit-samples 3500 \
+  --primitive-complexity-weight 0.012 \
+  --primitive-contact-mode fixed \
+  --primitive-interface-max-sides 12 \
+  --primitive-interface-min-width-ratio 0.004 \
+  --primitive-interface-plane-tolerance-ratio 0.000001 \
+  --primitive-surface-main-body-min-area-ratio 0.35 \
+  --primitive-surface-boundary-rings 0 \
+  --primitive-surface-search-steps 18 \
+  --face-resolution 96 \
+  --surface-samples 500000 \
+  --palette-size 0 \
+  --texture-filter bilinear \
+  --uv-wrap clamp \
+  --padding 2
+```
+
+## 狐狸完全保持旧 Closed Primitive
+
+把以下参数改为：
+
+```bash
+--primitive-part-mode closed
+```
+
+其余 Primitive 参数可以继续使用。该模式不会启用主体受约束减面。
+
+
+## V29 FitOBJ 说明
+
+V29 修复 `Constrained surface boundary is not a collection of simple loops`。已有 Hunyuan3D 和 PartField 结果无需重跑，升级并执行 Stage 3 `--postprocess-only` 即可。苹果脚本：
+
+```bash
+SOURCE_GLB="$SOURCE_GLB" \
+NORMALIZED_MESH="$NORMALIZED_MESH" \
+LABELS="$LABELS" \
+CLUSTERS=3 \
+OUTPUT_DIR=apple_primitive_fitonly_v30 \
+bash run_apple_primitive_v30_fitonly.sh
+```
+
+
+## V30 FitOBJ：固定接口局部侧向验证
+
+V30 修复 constrained-surface 主体跨越接口无限平面时的误判。固定接口仍严格检查平面、顶点集合和面积，但部件侧向改为检查接口帽附近的相邻三角形，不再用整个主体所有顶点的全局中位数作为连通性门槛。苹果主体即使弯曲跨过接口平面，也不会因此触发 `Frozen source-interface validation failed`。
+
+V30 还会在当前环境可用时优先调用 pymeshlab 的边界保持 QEM，将 dense constrained surface 降到纸模面数预算；接口边界坐标发生变化的结果会被拒绝并回退。
+
+## V32 FitOBJ 自动接触模式补充
+
+在 FitOBJ 阶段加入以下参数即可按接触强度自动处理：
+
+```bash
+--fit-mode primitive \
+--primitive-contact-mode auto \
+--primitive-contact-weak-threshold 0.20 \
+--primitive-contact-strong-threshold 0.55 \
+--primitive-contact-min-edge-count 6 \
+--primitive-contact-medium-mode connector \
+--primitive-surface-hard-max-faces 512 \
+--primitive-validation-policy repair
+```
+
+弱连接允许不相交；中等连接默认使用 connector；强连接才冻结原始接口。`--postprocess-only` 的使用方式不变。

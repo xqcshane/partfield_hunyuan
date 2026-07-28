@@ -94,6 +94,21 @@ class PipelineConfig:
     primitive_interface_max_sides: int = 8
     primitive_interface_min_width_ratio: float = 0.006
     primitive_interface_plane_tolerance_ratio: float = 1e-6
+    primitive_part_mode: str = "auto"
+    primitive_patch_min_segment_area_ratio: float = 0.10
+    primitive_patch_min_area_balance: float = 0.30
+    primitive_patch_min_interface_area_ratio: float = 0.14
+    primitive_patch_min_seam_length_ratio: float = 0.75
+    primitive_surface_main_body_min_area_ratio: float = 0.35
+    primitive_surface_boundary_rings: int = 0
+    primitive_surface_search_steps: int = 18
+    primitive_surface_min_reduction_ratio: float = 0.15
+    primitive_surface_hard_max_faces: int = 512
+    primitive_validation_policy: str = "repair"
+    primitive_contact_weak_threshold: float = 0.20
+    primitive_contact_strong_threshold: float = 0.55
+    primitive_contact_min_edge_count: int = 6
+    primitive_contact_medium_mode: str = "connector"
     simplify_faces: int = 50_000
     force: bool = False
 
@@ -191,6 +206,21 @@ def _run_primitive_postprocess(
         interface_max_sides=config.primitive_interface_max_sides,
         interface_min_width_ratio=config.primitive_interface_min_width_ratio,
         interface_plane_tolerance_ratio=config.primitive_interface_plane_tolerance_ratio,
+        part_mode=config.primitive_part_mode,
+        patch_min_segment_area_ratio=config.primitive_patch_min_segment_area_ratio,
+        patch_min_area_balance=config.primitive_patch_min_area_balance,
+        patch_min_interface_area_ratio=config.primitive_patch_min_interface_area_ratio,
+        patch_min_seam_length_ratio=config.primitive_patch_min_seam_length_ratio,
+        surface_main_body_min_area_ratio=config.primitive_surface_main_body_min_area_ratio,
+        surface_boundary_rings=config.primitive_surface_boundary_rings,
+        surface_search_steps=config.primitive_surface_search_steps,
+        surface_min_reduction_ratio=config.primitive_surface_min_reduction_ratio,
+        surface_hard_max_faces=config.primitive_surface_hard_max_faces,
+        validation_policy=config.primitive_validation_policy,
+        contact_weak_threshold=config.primitive_contact_weak_threshold,
+        contact_strong_threshold=config.primitive_contact_strong_threshold,
+        contact_min_edge_count=config.primitive_contact_min_edge_count,
+        contact_medium_mode=config.primitive_contact_medium_mode,
         category=config.category,
         forward_axis=config.forward_axis,
     )
@@ -258,18 +288,36 @@ def _run_primitive_postprocess(
             paper_model_glb,
             object_name="paper_model",
         )
+        allowed_separated_edges = next(
+            (
+                part.metadata.get("allowed_separated_contact_edges", [])
+                for part in parts
+                if part.metadata.get("allowed_separated_contact_edges") is not None
+            ),
+            [],
+        )
+        required_contact_graph_connected = bool(
+            all(
+                part.metadata.get("contact_required_graph_connected",
+                                  part.metadata.get("contact_graph_connected")) is True
+                for part in parts
+            )
+        )
+        spatially_connected_assembly = bool(
+            required_contact_graph_connected and not allowed_separated_edges
+        )
         paper_model_parts_json.write_text(
             json.dumps(
                 {
                     "stage": "paper_model_primitive_fit",
                     "description": (
-                        "One automatically selected closed polyhedral primitive per PartField "
-                        "cluster. The source cluster's simplified triangle count determines an "
-                        "automatic paper-face budget, and candidate type/face-count combinations "
-                        "are ranked by bidirectional geometric error plus paper complexity. "
-                        "Source label seams are reconstructed before candidate scoring as immutable "
-                        "shared interface polygons. Each outer primitive is fitted around those fixed "
-                        "joints, so connection position, orientation, area, and polygon vertices do not move."
+                        "Hybrid primitive fitting first classifies broad seams between similarly sized "
+                        "PartField regions as internal surface-patch seams and merges those regions into one "
+                        "physical body. Narrow seams remain independent paper parts. Each resulting body is "
+                        "fitted as one closed low-face primitive, while the remaining source seams are "
+                        "reconstructed as immutable shared interface polygons. This prevents one apple body "
+                        "from becoming several complete ellipsoids while preserving fox heads, legs, ears, "
+                        "and tails as separate closed paper shells."
                     ),
                     "recommended_blender_input": paper_model_obj.name,
                     "textured_preview_glb": paper_model_glb.name,
@@ -278,17 +326,21 @@ def _run_primitive_postprocess(
                     "boolean_union": False,
                     "cross_shell_vertex_welding": False,
                     "independent_closed_shells": True,
-                    "spatially_connected_assembly": bool(
-                        all(
-                            part.metadata.get("contact_graph_connected") is True
-                            for part in parts
-                        )
-                    ),
+                    "spatially_connected_assembly": spatially_connected_assembly,
+                    "required_contact_graph_connected": required_contact_graph_connected,
+                    "allowed_separated_contact_edges": allowed_separated_edges,
                     "contact_method": (
-                        "frozen source-interface polygons inserted before primitive scoring; "
-                        "outer surfaces are fitted around unchanged shared joints. Connectors are "
-                        "used only to bridge source components that had no original adjacency."
+                        "In auto contact mode, source seams are classified by scale-normalised interface "
+                        "area, seam length, edge count, and boundary point count. Strong seams use fixed "
+                        "interfaces, medium seams use stationary connector patches by default, and weak "
+                        "seams are allowed to separate without forcing an intersection."
                     ),
+                    "primitive_part_mode": str(config.primitive_part_mode),
+                    "surface_patch_groups": [
+                        part.metadata.get("source_segment_ids", [int(part.segment_id)])
+                        for part in parts
+                        if not bool(part.metadata.get("connector_part"))
+                    ],
                     "source_part_count": int(
                         sum(not bool(part.metadata.get("connector_part")) for part in parts)
                     ),
@@ -338,12 +390,9 @@ def _run_primitive_postprocess(
                     "recommended_blender_input": str(paper_model_obj),
                     "single_object": True,
                     "independent_closed_shells": True,
-                    "spatially_connected_assembly": bool(
-                        all(
-                            part.metadata.get("contact_graph_connected") is True
-                            for part in parts
-                        )
-                    ),
+                    "spatially_connected_assembly": spatially_connected_assembly,
+                    "required_contact_graph_connected": required_contact_graph_connected,
+                    "allowed_separated_contact_edges": allowed_separated_edges,
                     "source_part_count": int(
                         sum(not bool(part.metadata.get("connector_part")) for part in parts)
                     ),
@@ -385,6 +434,52 @@ def _run_primitive_postprocess(
             "primitive_interface_plane_tolerance_ratio": float(
                 config.primitive_interface_plane_tolerance_ratio
             ),
+            "primitive_part_mode": str(config.primitive_part_mode),
+            "primitive_patch_min_segment_area_ratio": float(
+                config.primitive_patch_min_segment_area_ratio
+            ),
+            "primitive_patch_min_area_balance": float(
+                config.primitive_patch_min_area_balance
+            ),
+            "primitive_patch_min_interface_area_ratio": float(
+                config.primitive_patch_min_interface_area_ratio
+            ),
+            "primitive_patch_min_seam_length_ratio": float(
+                config.primitive_patch_min_seam_length_ratio
+            ),
+            "primitive_surface_main_body_min_area_ratio": float(
+                config.primitive_surface_main_body_min_area_ratio
+            ),
+            "primitive_surface_boundary_rings": int(
+                config.primitive_surface_boundary_rings
+            ),
+            "primitive_surface_search_steps": int(
+                config.primitive_surface_search_steps
+            ),
+            "primitive_surface_min_reduction_ratio": float(
+                config.primitive_surface_min_reduction_ratio
+            ),
+            "primitive_surface_hard_max_faces": int(
+                config.primitive_surface_hard_max_faces
+            ),
+            "primitive_validation_policy": str(config.primitive_validation_policy),
+            "primitive_contact_weak_threshold": float(
+                config.primitive_contact_weak_threshold
+            ),
+            "primitive_contact_strong_threshold": float(
+                config.primitive_contact_strong_threshold
+            ),
+            "primitive_contact_min_edge_count": int(
+                config.primitive_contact_min_edge_count
+            ),
+            "primitive_contact_medium_mode": str(
+                config.primitive_contact_medium_mode
+            ),
+            "surface_patch_groups": [
+                part.metadata.get("source_segment_ids", [int(part.segment_id)])
+                for part in parts
+                if not bool(part.metadata.get("connector_part"))
+            ],
             "part_gap_ratio": float(config.part_gap_ratio),
             "face_resolution": int(config.face_resolution),
             "surface_samples": int(config.surface_samples),

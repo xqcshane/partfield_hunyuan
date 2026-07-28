@@ -649,3 +649,303 @@ fitting_strategy: local_patch_fit_around_fixed_source_interfaces
 fixed_interface_solver: nonconvex_local_adapter
 source_interface_geometry_changed: false
 ```
+
+
+## V26：精确冻结接口修复
+
+当 V25 已完成 Hunyuan3D 和 PartField，但在最后出现：
+
+```text
+Frozen source-interface validation failed for edges: [[A, B]]
+```
+
+不要继续放大 `--primitive-interface-plane-tolerance-ratio`。V26 会检查凸拟合生成的接口是否与原始冻结多边形完全一致；若凸包把接口扩大或合并到更大的共面面，会自动切换到局部非凸适配。部件所在接口两侧由 PartField 标签方向固定，不再由部件质心猜测。
+
+已有中间结果可直接通过 `--postprocess-only` 重跑 FitOBJ。推荐恢复：
+
+```bash
+--primitive-interface-plane-tolerance-ratio 0.000001
+```
+
+
+## V27：Hybrid Primitive 模式
+
+PartField 输出的是表面分区，不保证每个 label 都是独立实体。V27 在 primitive 拟合前增加一层判断：
+
+```text
+PartField labels
+  ↓
+宽而大的公共边界 + 两侧面积接近
+  → 同一主体的 surface patches，先合并
+
+窄接口 / 细长或薄片部件
+  → 保持独立 closed part
+  ↓
+对合并后的主体和独立部件分别拟合闭合 primitive
+  ↓
+保留剩余真实部件之间的固定接口
+```
+
+### 苹果推荐
+
+苹果被 PartField 分成两个大果体区域和一个果梗/叶片区域时，使用：
+
+```bash
+--fit-mode primitive \
+--primitive-part-mode auto \
+--primitive-contact-mode fixed
+```
+
+`auto` 会删除两个大果体区域之间的内部切缝，然后把它们作为一个完整果体拟合。控制台会出现：
+
+```text
+[PrimitiveHybrid] merging surface patches 15795 + 42173 (...)
+[PrimitiveHybrid] fitted groups=[[15795, 42173], [39996]]
+```
+
+### 狐狸兼容模式
+
+需要完全复现 V26 的一 label 一闭合壳体行为时，使用：
+
+```bash
+--fit-mode primitive \
+--primitive-part-mode closed \
+--primitive-contact-mode fixed
+```
+
+狐狸也可以尝试 `auto`。只有当 PartField 把同一个躯干切成具有大面积公共截面的多个表面区域时，它们才会被合并；细腿、尾巴、耳朵等细长或薄片部件会被保护为独立壳体。
+
+### 更积极的表面区域合并
+
+```bash
+--primitive-part-mode surface-patch
+```
+
+该模式降低自动合并阈值，但仍不会简单合并整个邻接图。建议只有在 `auto` 未能合并明显的主体分区时使用。
+
+### 分类阈值
+
+```bash
+--primitive-patch-min-segment-area-ratio 0.10
+--primitive-patch-min-area-balance 0.30
+--primitive-patch-min-interface-area-ratio 0.14
+--primitive-patch-min-seam-length-ratio 0.75
+```
+
+一般先使用默认值。`parts.json` 和 `paper_model_parts.json` 中可查看：
+
+```json
+{
+  "primitive_part_mode": "auto",
+  "source_segment_ids": [15795, 42173],
+  "surface_patch_group": true,
+  "surface_patch_group_size": 2,
+  "surface_patch_internal_seams_removed": []
+}
+```
+
+## V28：主体受约束网格减面 + 独立部件闭合 Primitive
+
+V27 只完成了表面 labels 的合并判断，但合并后的主体仍会被替换成完整 PCA 椭球或凸体。对于苹果，这会丢失顶部凹陷、底部轮廓和整体比例。
+
+V28 的 `auto` 模式改为：
+
+```text
+PartField labels
+  ↓
+识别同一主体的宽表面分区
+  ↓
+主体：constrained mesh simplification
+  - 使用原始表面坐标
+  - 固定连接界面
+  - 减少外表面三角形
+  - 不执行 PCA 椭球替换
+
+独立部件：closed primitive fitting
+  - 头、腿、尾巴、耳朵
+  - 果梗、叶片等
+```
+
+### 苹果推荐参数
+
+```bash
+--fit-mode primitive \
+--primitive-part-mode auto \
+--primitive-contact-mode fixed \
+--primitive-max-faces 72 \
+--primitive-max-sides 24 \
+--primitive-surface-main-body-min-area-ratio 0.35 \
+--primitive-surface-boundary-rings 0 \
+--primitive-surface-search-steps 18
+```
+
+主体成功进入新算法时，控制台会出现：
+
+```text
+[PrimitiveHybrid] constrained surface groups=[...]
+[PrimitiveFit] ... selected=constrained_surface
+```
+
+`paper_model_parts.json` 中可检查：
+
+```json
+{
+  "primitive_type": "constrained_surface",
+  "fitting_strategy": "constrained_mesh_simplification",
+  "source_surface_geometry_preserved": true,
+  "pca_primitive_replacement_applied": false,
+  "fixed_boundary_collapse_applied": true
+}
+```
+
+### 狐狸保持旧的闭合 Primitive
+
+需要完全保持之前狐狸的“一条 PartField label 对应一个闭合 primitive”时：
+
+```bash
+--fit-mode primitive \
+--primitive-part-mode closed \
+--primitive-contact-mode fixed
+```
+
+需要让狐狸躯干保留更多原始轮廓，而腿、尾巴、耳朵继续使用闭合 primitive 时：
+
+```bash
+--fit-mode primitive \
+--primitive-part-mode auto \
+--primitive-contact-mode fixed
+```
+
+### 新参数
+
+```bash
+--primitive-surface-main-body-min-area-ratio 0.35
+```
+
+控制 `auto` 模式下，最大非薄片部件至少占总表面积多少才作为主体进行受约束减面。
+
+```bash
+--primitive-surface-boundary-rings 0
+```
+
+接口多边形始终会被冻结。`0` 只冻结接口本身，最容易达到目标面数；`1` 额外冻结接口周围一圈源顶点，会更保形，但面数可能明显增加。
+
+```bash
+--primitive-surface-search-steps 18
+```
+
+控制减面器尝试多少种空间网格精度。默认值通常不需要修改。
+
+
+## V29：Constrained Surface 边界拓扑修复
+
+当多个 PartField 主体 label 合并后，三个 label 可能在同一个顶点相遇。此时边界在几何上仍然正确，但拓扑上可能是两个闭环只共享一个顶点。V28 会将其识别为分叉边界并退出。V29 会在不移动顶点坐标的前提下，将该共享顶点按 incident-face fan 拆成多个拓扑顶点，再继续固定接口和受约束减面。
+
+苹果继续使用：
+
+```bash
+--fit-mode primitive \
+--primitive-part-mode auto \
+--primitive-contact-mode fixed
+```
+
+狐狸保持旧行为使用：
+
+```bash
+--fit-mode primitive \
+--primitive-part-mode closed \
+--primitive-contact-mode fixed
+```
+
+诊断字段：
+
+```json
+"source_patch_topology_repair": {
+  "split_nonmanifold_vertex_count": 2,
+  "added_topology_vertex_count": 2
+}
+```
+
+
+## V30：固定接口局部侧向验证
+
+V29 的固定接口验证使用整个部件非接口顶点的 signed-distance 中位数判断两个壳体是否位于接口平面两侧。该方法适合凸 primitive，但 constrained surface 主体可能自然跨越接口的无限延伸平面，从而出现接口顶点、面积、平面均完全一致，却仍因 `opposite_sides=False` 被拒绝。
+
+V30 改为：
+
+- 严格保留接口平面、顶点集合和面积验证；
+- 使用直接共享接口帽边的相邻三角形第三顶点判断局部材料侧；
+- 全局 bulk signed distance 只保留为诊断信息；
+- 局部环退化时，使用已定向闭合壳体的接口帽内侧方向作为回退；
+- `paper_model_parts.json` 记录 `local_side_*`、`side_validation_method` 和 `side_geometry_valid`；
+- 若 pymeshlab 可用，优先尝试保边界 QEM 以避免 constrained surface 回退到数万面。
+
+## V31：强制减面与鲁棒继续
+
+V31 新增：
+
+```bash
+--primitive-surface-min-reduction-ratio 0.15
+--primitive-validation-policy repair
+```
+
+`repair` 会在固定接口辅助侧向判断有歧义时，优先依据完全一致的共享接口几何继续处理；必要时自动使用 connector 兜底，而不是终止整个模型。constrained surface 会优先使用边界保持 QEM，并将接口边界吸附回精确坐标；只有所有安全减面方案均失败时才保留源表面，并在 `paper_model_parts.json` 中显式记录。
+
+完整说明见 `CHANGES_V31_ROBUST_SIMPLIFY_AND_CONTINUE.md`。
+
+---
+
+## V32：按接触强度自动分类
+
+新增：
+
+```bash
+--primitive-contact-mode auto
+```
+
+自动模式不会再把所有 PartField 相邻边都当成必须保持的硬连接。每条连接会根据接口面积、边界长度、相邻边数量和边界点数量分类：
+
+- `strong`：使用固定共享接口；
+- `medium`：默认增加不移动主体的连接件；
+- `weak`：允许最终分离，并在不破坏其他强连接时去除拟合后的意外穿插。
+
+主要参数：
+
+```bash
+--primitive-contact-weak-threshold 0.20 \
+--primitive-contact-strong-threshold 0.55 \
+--primitive-contact-min-edge-count 6 \
+--primitive-contact-medium-mode connector
+```
+
+Constrained surface 还增加硬面数上限：
+
+```bash
+--primitive-surface-hard-max-faces 512
+```
+
+超过上限时不会直接进入纹理阶段，而会继续使用低面回退模型，避免出现数万张 paper face texture tile。
+
+苹果可运行：
+
+```bash
+SOURCE_GLB="$SOURCE_GLB" \
+NORMALIZED_MESH="$NORMALIZED_MESH" \
+LABELS="$LABELS" \
+CLUSTERS=3 \
+OUTPUT_DIR=apple_primitive_v32_auto_contact \
+bash run_apple_primitive_v32_auto_contact_fitonly.sh
+```
+
+狐狸可运行：
+
+```bash
+SOURCE_GLB="$SOURCE_GLB" \
+NORMALIZED_MESH="$NORMALIZED_MESH" \
+LABELS="$LABELS" \
+CLUSTERS=8 \
+OUTPUT_DIR=fox_primitive_v32_auto_contact \
+bash run_fox_primitive_v32_auto_contact_fitonly.sh
+```
+
+注意：V32 的 primitive 仍然是代码生成的 box、prism、frustum、cone、ellipsoid 和 convex 候选；尚未接入外部 OBJ/GLB 预设模型库。

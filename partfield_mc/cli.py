@@ -148,6 +148,96 @@ def build_parser() -> argparse.ArgumentParser:
         ),
     )
     p.add_argument(
+        "--primitive-part-mode",
+        choices=("auto", "closed", "surface-patch"),
+        default="auto",
+        help=(
+            "How PartField labels become physical paper parts. auto merges broad main-body "
+            "surface patches and simplifies that source surface with fixed boundaries, while "
+            "thin/elongated appendages remain closed primitives. closed preserves the V26/V27 "
+            "one-label-one-primitive behaviour. surface-patch uses a more permissive main-body "
+            "classifier but still protects thin appendages."
+        ),
+    )
+    p.add_argument(
+        "--primitive-patch-min-segment-area-ratio",
+        type=float,
+        default=0.10,
+        help="Minimum smaller-segment area fraction required for an automatic surface-patch merge",
+    )
+    p.add_argument(
+        "--primitive-patch-min-area-balance",
+        type=float,
+        default=0.30,
+        help="Minimum smaller/larger source-area ratio required for an automatic patch merge",
+    )
+    p.add_argument(
+        "--primitive-patch-min-interface-area-ratio",
+        type=float,
+        default=0.14,
+        help="Minimum reconstructed seam area divided by the smaller segment area",
+    )
+    p.add_argument(
+        "--primitive-patch-min-seam-length-ratio",
+        type=float,
+        default=0.75,
+        help="Minimum seam length divided by sqrt(smaller segment area)",
+    )
+    p.add_argument(
+        "--primitive-surface-main-body-min-area-ratio",
+        type=float,
+        default=0.35,
+        help=(
+            "Minimum total source-area fraction for the largest non-thin group to use "
+            "boundary-locked constrained mesh simplification in auto mode."
+        ),
+    )
+    p.add_argument(
+        "--primitive-surface-boundary-rings",
+        type=int,
+        default=0,
+        help=(
+            "Number of extra source vertex rings frozen around each PartField attachment boundary "
+            "during constrained surface simplification (0-4)."
+        ),
+    )
+    p.add_argument(
+        "--primitive-surface-search-steps",
+        type=int,
+        default=18,
+        help="Number of grid resolutions evaluated by the constrained surface simplifier.",
+    )
+    p.add_argument(
+        "--primitive-surface-min-reduction-ratio",
+        type=float,
+        default=0.15,
+        help=(
+            "Minimum required constrained-surface face reduction fraction. The default 0.15 "
+            "requires at least 15%% fewer outer triangles; robust fallback keeps the most reduced "
+            "topology-safe result instead of silently returning the original dense patch."
+        ),
+    )
+    p.add_argument(
+        "--primitive-surface-hard-max-faces",
+        type=int,
+        default=512,
+        help=(
+            "Hard maximum faces for one constrained-surface paper part. If source-preserving "
+            "simplification cannot satisfy this ceiling, the pipeline uses a low-face source-derived "
+            "convex or closed-primitive fallback before texture atlas generation."
+        ),
+    )
+    p.add_argument(
+        "--primitive-validation-policy",
+        choices=("strict", "repair", "warn"),
+        default="repair",
+        help=(
+            "Fixed-interface failure policy. repair (default) accepts exact shared geometry when "
+            "side tests are ambiguous, attempts canonical interface repair, and continues with "
+            "warnings; warn never aborts; strict preserves fail-fast validation."
+        ),
+    )
+    p.add_argument(
         "--primitive-types",
         default="auto",
         help=(
@@ -212,12 +302,42 @@ def build_parser() -> argparse.ArgumentParser:
     )
     p.add_argument(
         "--primitive-contact-mode",
-        choices=("fixed", "connector", "move"),
-        default="fixed",
+        choices=("auto", "fixed", "connector", "move"),
+        default="auto",
         help=(
-            "Contact strategy for primitive mode. fixed reconstructs every source label seam first "
-            "and fits each outer primitive around that immutable shared face; connector is the V23 "
-            "stationary-parts strategy; move is the legacy V22 rigid relocation strategy."
+            "Contact strategy for primitive mode. auto classifies each source seam by contact strength: "
+            "strong=fixed shared interface, medium=stationary connector by default, weak=allowed to "
+            "separate. fixed forces every seam, connector adds stationary joints, and move is legacy."
+        ),
+    )
+    p.add_argument(
+        "--primitive-contact-weak-threshold",
+        type=float,
+        default=0.20,
+        help="Auto-contact score below which the fitted parts may remain separated.",
+    )
+    p.add_argument(
+        "--primitive-contact-strong-threshold",
+        type=float,
+        default=0.55,
+        help="Auto-contact score at or above which an immutable shared interface is required.",
+    )
+    p.add_argument(
+        "--primitive-contact-min-edge-count",
+        type=int,
+        default=6,
+        help=(
+            "Source boundary edges required before a seam can be medium/strong. Fewer edges always "
+            "classify as weak, preventing accidental point/short-edge contacts from being forced."
+        ),
+    )
+    p.add_argument(
+        "--primitive-contact-medium-mode",
+        choices=("connector", "separate"),
+        default="connector",
+        help=(
+            "Handling for medium-strength seams in auto mode. connector preserves placement and adds "
+            "a small paper joint; separate permits a gap without moving the main parts."
         ),
     )
     p.add_argument(
@@ -391,6 +511,21 @@ def main(argv: list[str] | None = None) -> int:
         primitive_interface_max_sides=args.primitive_interface_max_sides,
         primitive_interface_min_width_ratio=args.primitive_interface_min_width_ratio,
         primitive_interface_plane_tolerance_ratio=args.primitive_interface_plane_tolerance_ratio,
+        primitive_part_mode=args.primitive_part_mode,
+        primitive_patch_min_segment_area_ratio=args.primitive_patch_min_segment_area_ratio,
+        primitive_patch_min_area_balance=args.primitive_patch_min_area_balance,
+        primitive_patch_min_interface_area_ratio=args.primitive_patch_min_interface_area_ratio,
+        primitive_patch_min_seam_length_ratio=args.primitive_patch_min_seam_length_ratio,
+        primitive_surface_main_body_min_area_ratio=args.primitive_surface_main_body_min_area_ratio,
+        primitive_surface_boundary_rings=args.primitive_surface_boundary_rings,
+        primitive_surface_search_steps=args.primitive_surface_search_steps,
+        primitive_surface_min_reduction_ratio=args.primitive_surface_min_reduction_ratio,
+        primitive_surface_hard_max_faces=args.primitive_surface_hard_max_faces,
+        primitive_validation_policy=args.primitive_validation_policy,
+        primitive_contact_weak_threshold=args.primitive_contact_weak_threshold,
+        primitive_contact_strong_threshold=args.primitive_contact_strong_threshold,
+        primitive_contact_min_edge_count=args.primitive_contact_min_edge_count,
+        primitive_contact_medium_mode=args.primitive_contact_medium_mode,
         simplify_faces=args.simplify_faces,
         force=args.force,
     )

@@ -4,8 +4,8 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "partfield-mc-pipeline"
-version = "0.11.0"
-description = "NVIDIA PartField segmentation to textured cuboids and interface-constrained paper primitives with frozen source joints and non-convex local patch fitting"
+version = "0.32.0"
+description = "PartField to textured paper models with mandatory constrained simplification, repair-oriented interface validation, and resilient closed primitive fallbacks"
 requires-python = ">=3.10"
 dependencies = [
   "numpy>=1.24",
