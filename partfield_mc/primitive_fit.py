@@ -27,6 +27,9 @@ class PrimitiveFitConfig:
     max_sides: int = 24
     fit_samples: int = 2500
     complexity_weight: float = 0.025
+    template_mode: str = "adaptive"
+    regularity_weight: float = 0.08
+    regular_connector_max_face_area_ratio: float = 0.08
     allowed_types: tuple[str, ...] = (
         "box",
         "prism",
@@ -62,6 +65,9 @@ class PrimitiveFitConfig:
     contact_strong_threshold: float = 0.55
     contact_min_edge_count: int = 6
     contact_medium_mode: str = "connector"
+    contact_proximity_ratio: float = 0.015
+    contact_proximity_min_points: int = 8
+    contact_proximity_min_coverage: float = 0.01
     category: str = "generic"
     forward_axis: str = "auto"
     seed: int = 12345
@@ -212,6 +218,10 @@ class _SourceContact:
     interface_normal: np.ndarray
     interface_axis_u: np.ndarray
     interface_axis_v: np.ndarray
+    source_kind: str = "topological"
+    proximity_distance: float = 0.0
+    proximity_point_count: int = 0
+    proximity_coverage: float = 0.0
 
 
 @dataclass(frozen=True)
@@ -229,6 +239,10 @@ class _ContactStrength:
     edge_count: int
     unique_point_count: int
     forced_weak_by_edge_count: bool
+    source_kind: str = "topological"
+    proximity_distance: float = 0.0
+    proximity_point_count: int = 0
+    proximity_coverage: float = 0.0
 
     def as_dict(self) -> dict[str, object]:
         return {
@@ -242,6 +256,10 @@ class _ContactStrength:
             "edge_count": int(self.edge_count),
             "unique_point_count": int(self.unique_point_count),
             "forced_weak_by_edge_count": bool(self.forced_weak_by_edge_count),
+            "source_kind": str(self.source_kind),
+            "proximity_distance": float(self.proximity_distance),
+            "proximity_point_count": int(self.proximity_point_count),
+            "proximity_coverage": float(self.proximity_coverage),
         }
 
 
@@ -434,7 +452,17 @@ def _box_candidate(points: np.ndarray) -> _Candidate:
         [2, 3, 7, 6],
         [3, 0, 4, 7],
     ]
-    return _canonical_candidate("box", vertices, polygons)
+    return _canonical_candidate(
+        "box",
+        vertices,
+        polygons,
+        metadata={
+            "canonical_template": "box",
+            "canonical_template_topology_locked": True,
+            "regular_attachment_policy": "all_planar_faces",
+            "regular_attachment_face_indices": list(range(6)),
+        },
+    )
 
 
 def _axis_basis(rotation: np.ndarray, axis: int) -> np.ndarray:
@@ -501,6 +529,7 @@ def _prism_candidate(
     phase: float,
     *,
     frustum: bool,
+    regular: bool = False,
 ) -> _Candidate:
     basis = _axis_basis(rotation, axis)
     local_points = (points - center[None, :]) @ basis
@@ -533,6 +562,12 @@ def _prism_candidate(
             ),
         )
         radii_low = radii_high = radii
+    if regular:
+        # Canonical frusta/prisms remain coaxial.  Source-patch centroids may
+        # drift laterally and otherwise create a visibly sheared template.
+        canonical_center = np.asarray(summary["center_all"], dtype=np.float64)
+        center_low = canonical_center.copy()
+        center_high = canonical_center.copy()
     low = _ring(t0, center_low, radii_low, sides, phase)
     high = _ring(t1, center_high, radii_high, sides, phase)
     local_vertices = np.vstack((low, high))
@@ -551,6 +586,11 @@ def _prism_candidate(
             "axis": int(axis),
             "sides": int(sides),
             "phase": float(phase),
+            "canonical_template": label,
+            "canonical_template_topology_locked": True,
+            "regular_attachment_policy": "axial_caps",
+            "regular_attachment_face_indices": [0, 1],
+            "canonical_coaxial": bool(regular),
             **({"taper_strength": taper_strength} if frustum else {}),
         },
     )
@@ -563,6 +603,8 @@ def _cone_candidate(
     axis: int,
     sides: int,
     phase: float,
+    *,
+    regular: bool = False,
 ) -> _Candidate:
     basis = _axis_basis(rotation, axis)
     local_points = (points - center[None, :]) @ basis
@@ -590,6 +632,10 @@ def _cone_candidate(
     radius_ratio = float(
         np.sqrt(max(min(low_radius, high_radius), 1e-12) / max(max(low_radius, high_radius), 1e-12))
     )
+    if regular:
+        canonical_center = np.asarray(summary["center_all"], dtype=np.float64)
+        apex_center = canonical_center.copy()
+        base_center = canonical_center.copy()
     ring = _ring(base_t, base_center, base_radii, sides, phase)
     apex = np.asarray([[apex_t, apex_center[0], apex_center[1]]], dtype=np.float64)
     local_vertices = np.vstack((ring, apex))
@@ -609,6 +655,11 @@ def _cone_candidate(
             "sides": int(sides),
             "phase": float(phase),
             "end_radius_ratio": radius_ratio,
+            "canonical_template": "cone",
+            "canonical_template_topology_locked": True,
+            "regular_attachment_policy": "base_cap",
+            "regular_attachment_face_indices": [0],
+            "canonical_coaxial": bool(regular),
         },
     )
 
@@ -680,6 +731,9 @@ def _ellipsoid_candidate(
             "segments": int(segments),
             "rings": int(rings),
             "phase": float(phase),
+            "canonical_template": "ellipsoid",
+            "canonical_template_topology_locked": True,
+            "regular_attachment_policy": "polar_face_band",
         },
     )
 
@@ -727,6 +781,9 @@ def _convex_candidate(points: np.ndarray, target_faces: int, direction_count: in
         metadata={
             "direction_count": int(direction_count),
             "requested_target_faces": int(target_faces),
+            "canonical_template": "source_support_convex",
+            "canonical_template_topology_locked": True,
+            "regular_attachment_policy": "all_faces",
         },
     )
 
@@ -766,6 +823,7 @@ def _score_candidate(
     fit_samples: int,
     complexity_weight: float,
     rng: np.random.Generator,
+    regularity_weight: float = 0.0,
 ) -> None:
     mesh = candidate.mesh()
     candidate_points = _sample_mesh(mesh, fit_samples, rng)
@@ -789,11 +847,15 @@ def _score_candidate(
     else:
         volume_log_error = 0.0
 
+    template_name = str(candidate.metadata.get("canonical_template", ""))
+    template_irregularity = 1.0 if template_name == "source_support_convex" else 0.0
+    regularity_penalty = float(regularity_weight) * template_irregularity
     score = (
         bidirectional_mean
         + 0.20 * bidirectional_p95
         + float(complexity_weight) * (0.70 * face_delta + 0.30 * paper_complexity)
         + 0.010 * volume_log_error
+        + regularity_penalty
         + float(candidate.type_penalty)
     )
     candidate.score = float(score)
@@ -807,6 +869,8 @@ def _score_candidate(
         "face_delta_ratio": float(face_delta),
         "paper_complexity_ratio": float(paper_complexity),
         "volume_log_error": float(volume_log_error),
+        "template_irregularity": float(template_irregularity),
+        "regularity_penalty": float(regularity_penalty),
         "score": float(score),
     }
 
@@ -839,19 +903,24 @@ def _build_candidates(
                 if "prism" in allowed:
                     append(
                         lambda axis=axis, sides=sides, phase=phase: _prism_candidate(
-                            points, center, rotation, axis, sides, phase, frustum=False
+                            points, center, rotation, axis, sides, phase,
+                            frustum=False,
+                            regular=(str(config.template_mode).strip().lower() == "regular"),
                         )
                     )
                 if "frustum" in allowed:
                     append(
                         lambda axis=axis, sides=sides, phase=phase: _prism_candidate(
-                            points, center, rotation, axis, sides, phase, frustum=True
+                            points, center, rotation, axis, sides, phase,
+                            frustum=True,
+                            regular=(str(config.template_mode).strip().lower() == "regular"),
                         )
                     )
                 if "cone" in allowed and sides + 1 <= config.max_faces:
                     append(
                         lambda axis=axis, sides=sides, phase=phase: _cone_candidate(
-                            points, center, rotation, axis, sides, phase
+                            points, center, rotation, axis, sides, phase,
+                            regular=(str(config.template_mode).strip().lower() == "regular"),
                         )
                     )
 
@@ -882,7 +951,11 @@ def _build_candidates(
                         )
                     )
 
-    if "convex" in allowed:
+    regular_mode = str(config.template_mode).strip().lower() == "regular"
+    use_convex = "convex" in allowed and (
+        not regular_mode or not candidates or allowed == {"convex"}
+    )
+    if use_convex:
         estimated_vertices = max(6, int(round((target_faces + 4) * 0.5)))
         for direction_count in sorted(
             {
@@ -1797,6 +1870,11 @@ def _fit_one_cluster(
             config.fit_samples,
             config.complexity_weight,
             rng,
+            regularity_weight=(
+                config.regularity_weight
+                if str(config.template_mode).strip().lower() == "regular"
+                else 0.0
+            ),
         )
     candidates.sort(key=lambda item: (item.score, item.face_count, item.primitive_type))
     selected = candidates[0]
@@ -1846,8 +1924,55 @@ def _fit_one_cluster(
             "untextured_contact_face_indices": selected.metadata.get(
                 "untextured_contact_face_indices", []
             ),
+            "primitive_template_mode": str(config.template_mode),
+            "canonical_template": selected.metadata.get(
+                "canonical_template", selected.primitive_type
+            ),
+            "canonical_template_topology_locked": bool(
+                selected.metadata.get("canonical_template_topology_locked", False)
+            ),
+            "regular_attachment_policy": selected.metadata.get(
+                "regular_attachment_policy", "all_faces"
+            ),
+            "regular_attachment_face_indices": selected.metadata.get(
+                "regular_attachment_face_indices", []
+            ),
+            "local_interface_deformation_applied": bool(
+                selected.metadata.get("fitting_strategy")
+                in {
+                    "fit_outer_surface_around_fixed_source_interfaces",
+                    "local_patch_fit_around_fixed_source_interfaces",
+                }
+            ),
         },
     )
+
+
+def _normalised_template_edge_lengths(part: PrimitivePart) -> np.ndarray:
+    """Rigid-motion invariant signature used to guard canonical template shape."""
+
+    vertices = np.asarray(part.vertices, dtype=np.float64)
+    seen: set[tuple[int, int]] = set()
+    lengths: list[float] = []
+    for polygon in part.polygons:
+        ids = [int(value) for value in polygon]
+        for a, b in zip(ids, ids[1:] + ids[:1]):
+            edge = tuple(sorted((a, b)))
+            if edge in seen:
+                continue
+            seen.add(edge)
+            lengths.append(float(np.linalg.norm(vertices[edge[0]] - vertices[edge[1]])))
+    values = np.sort(np.asarray(lengths, dtype=np.float64))
+    scale = max(float(np.linalg.norm(part.size)), 1e-12)
+    return values / scale
+
+
+def _template_shape_signature_error(reference: np.ndarray, part: PrimitivePart) -> float:
+    current = _normalised_template_edge_lengths(part)
+    reference = np.asarray(reference, dtype=np.float64)
+    if len(current) != len(reference):
+        return float("inf")
+    return float(np.max(np.abs(current - reference))) if len(current) else 0.0
 
 
 def _part_test_points(part: PrimitivePart) -> np.ndarray:
@@ -2057,6 +2182,154 @@ def _source_label_contacts(
     return contacts
 
 
+def _augment_contacts_with_spatial_proximity(
+    mesh: trimesh.Trimesh,
+    cluster_faces: dict[int, np.ndarray],
+    contacts: dict[tuple[int, int], _SourceContact],
+    config: PrimitiveFitConfig,
+    model_extent: float,
+) -> dict[tuple[int, int], _SourceContact]:
+    """Infer near-contact seams when parts are spatially close but not topologically welded.
+
+    Hunyuan meshes can contain a tiny gap between a cap and bottle neck, or
+    between an animal limb and torso.  Shared-edge-only logic incorrectly marks
+    those pairs as unrelated.  This pass uses dense source vertices and a
+    scale-normalised distance threshold to add conservative proximity contacts.
+    """
+
+    threshold = max(float(config.contact_proximity_ratio) * model_extent, model_extent * 1e-8)
+    minimum_points = max(int(config.contact_proximity_min_points), 1)
+    minimum_coverage = float(config.contact_proximity_min_coverage)
+    if threshold <= 0.0 or minimum_coverage <= 0.0:
+        return dict(contacts)
+
+    result = dict(contacts)
+    vertices = np.asarray(mesh.vertices, dtype=np.float64)
+    faces = np.asarray(mesh.faces, dtype=np.int64)
+    point_sets: dict[int, np.ndarray] = {}
+    centers: dict[int, np.ndarray] = {}
+    for segment_id, face_ids in cluster_faces.items():
+        local_face_ids = np.asarray(face_ids, dtype=np.int64)
+        ids = np.unique(faces[local_face_ids].reshape(-1))
+        triangles = np.asarray(mesh.triangles[local_face_ids], dtype=np.float64)
+        edge_midpoints = np.vstack(
+            (
+                0.5 * (triangles[:, 0] + triangles[:, 1]),
+                0.5 * (triangles[:, 1] + triangles[:, 2]),
+                0.5 * (triangles[:, 2] + triangles[:, 0]),
+            )
+        )
+        points = np.vstack(
+            (
+                vertices[ids],
+                np.asarray(mesh.triangles_center[local_face_ids], dtype=np.float64),
+                edge_midpoints,
+            )
+        )
+        if len(points) > 2500:
+            selection = np.linspace(0, len(points) - 1, 2500, dtype=np.int64)
+            points = points[selection]
+        point_sets[int(segment_id)] = np.asarray(points, dtype=np.float64)
+        centers[int(segment_id)] = np.mean(points, axis=0)
+
+    segment_ids = sorted(point_sets)
+    for index, segment_a in enumerate(segment_ids):
+        points_a = point_sets[segment_a]
+        if len(points_a) == 0:
+            continue
+        for segment_b in segment_ids[index + 1 :]:
+            pair = (int(segment_a), int(segment_b))
+            if pair in result:
+                continue
+            points_b = point_sets[segment_b]
+            if len(points_b) == 0:
+                continue
+
+            if len(points_a) <= len(points_b):
+                query_points, target_points = points_a, points_b
+                query_is_a = True
+            else:
+                query_points, target_points = points_b, points_a
+                query_is_a = False
+            distances, nearest = cKDTree(target_points).query(query_points, k=1, workers=-1)
+            near = np.flatnonzero(distances <= threshold)
+            coverage = float(len(near) / max(min(len(points_a), len(points_b)), 1))
+            if len(near) < minimum_points or coverage < minimum_coverage:
+                continue
+
+            query_close = query_points[near]
+            target_close = target_points[np.asarray(nearest[near], dtype=np.int64)]
+            if query_is_a:
+                points_from_a, points_from_b = query_close, target_close
+            else:
+                points_from_a, points_from_b = target_close, query_close
+            midpoints = 0.5 * (points_from_a + points_from_b)
+            rounded = np.round(midpoints, decimals=10)
+            _, unique_indices = np.unique(rounded, axis=0, return_index=True)
+            midpoints = midpoints[np.sort(unique_indices)]
+            if len(midpoints) < minimum_points:
+                continue
+
+            direction = centers[segment_b] - centers[segment_a]
+            difference = np.median(points_from_b - points_from_a, axis=0)
+            if float(np.linalg.norm(difference)) > 1e-12:
+                normal = difference / float(np.linalg.norm(difference))
+                if float(np.dot(normal, direction)) < 0.0:
+                    normal *= -1.0
+            else:
+                normal = direction
+            if float(np.linalg.norm(direction)) <= 1e-12:
+                direction = normal
+            direction = direction / max(float(np.linalg.norm(direction)), 1e-12)
+            normal = normal / max(float(np.linalg.norm(normal)), 1e-12)
+            anchor = np.median(midpoints, axis=0)
+            axis_u, axis_v = _basis_from_normal(normal)
+
+            projected = np.column_stack(
+                ((midpoints - anchor) @ axis_u, (midpoints - anchor) @ axis_v)
+            )
+            boundary_length = 0.0
+            if len(projected) >= 3:
+                try:
+                    hull = ConvexHull(projected)
+                    ring = projected[hull.vertices]
+                    boundary_length = float(
+                        np.sum(np.linalg.norm(np.roll(ring, -1, axis=0) - ring, axis=1))
+                    )
+                except QhullError:
+                    boundary_length = 0.0
+            if boundary_length <= 1e-12:
+                boundary_length = max(
+                    float(np.ptp(projected[:, 0]) + np.ptp(projected[:, 1])),
+                    threshold,
+                )
+
+            median_distance = float(np.median(distances[near]))
+            result[pair] = _SourceContact(
+                segment_a=int(segment_a),
+                segment_b=int(segment_b),
+                anchor=np.asarray(anchor, dtype=np.float64),
+                boundary_length=float(boundary_length),
+                edge_count=int(len(midpoints)),
+                boundary_points=np.asarray(midpoints, dtype=np.float64),
+                direction_a_to_b=np.asarray(direction, dtype=np.float64),
+                interface_normal=np.asarray(normal, dtype=np.float64),
+                interface_axis_u=np.asarray(axis_u, dtype=np.float64),
+                interface_axis_v=np.asarray(axis_v, dtype=np.float64),
+                source_kind="spatial_proximity",
+                proximity_distance=median_distance,
+                proximity_point_count=int(len(midpoints)),
+                proximity_coverage=float(coverage),
+            )
+            print(
+                "[PrimitiveContactProximity] "
+                f"edge={pair} distance={median_distance:.6g} "
+                f"points={len(midpoints)} coverage={coverage:.4f}",
+                flush=True,
+            )
+    return result
+
+
 def _classify_contact_strengths(
     mesh: trimesh.Trimesh,
     cluster_faces: dict[int, np.ndarray],
@@ -2135,12 +2408,17 @@ def _classify_contact_strengths(
             edge_count=int(contact.edge_count),
             unique_point_count=unique_points,
             forced_weak_by_edge_count=forced_weak,
+            source_kind=str(contact.source_kind),
+            proximity_distance=float(contact.proximity_distance),
+            proximity_point_count=int(contact.proximity_point_count),
+            proximity_coverage=float(contact.proximity_coverage),
         )
         print(
             "[PrimitiveContactStrength] "
             f"edge={pair} class={classification} score={score:.4f} "
             f"area_ratio={area_ratio:.5f} seam_ratio={seam_ratio:.4f} "
-            f"edges={int(contact.edge_count)} points={unique_points}",
+            f"edges={int(contact.edge_count)} points={unique_points} "
+            f"source={contact.source_kind}",
             flush=True,
         )
     return results
@@ -2614,6 +2892,52 @@ def _face_patch_capacity(
     return max(0.0, float(capacity)), float(area), axis_u, axis_v
 
 
+def _regular_attachment_face_indices(
+    part: PrimitivePart,
+    desired_outward: np.ndarray,
+) -> list[int]:
+    """Return canonical attachment faces without modifying the template body.
+
+    Axial templates attach through their end caps.  Ellipsoids have no single
+    cap polygon, so a small polar face band is selected in the requested
+    direction.  Convex/source-derived fallbacks retain all faces because they
+    have no canonical attachment topology.
+    """
+
+    metadata = part.metadata.get("selected_candidate_metadata", {})
+    if not isinstance(metadata, dict):
+        metadata = {}
+    explicit = metadata.get("regular_attachment_face_indices")
+    if isinstance(explicit, (list, tuple)):
+        indices = sorted(
+            {int(value) for value in explicit if 0 <= int(value) < part.face_count}
+        )
+        if indices:
+            return indices
+
+    primitive = str(part.primitive_type).lower()
+    if primitive.startswith(("prism_", "frustum_")) and part.face_count >= 2:
+        return [0, 1]
+    if primitive.startswith("cone_") and part.face_count >= 1:
+        return [0]
+    if primitive == "box":
+        return list(range(part.face_count))
+    if primitive.startswith("ellipsoid_"):
+        direction = np.asarray(desired_outward, dtype=np.float64)
+        direction /= max(float(np.linalg.norm(direction)), 1e-12)
+        records: list[tuple[float, float, int]] = []
+        for face_index in range(part.face_count):
+            points, center, normal = _face_geometry(part, face_index)
+            alignment = float(np.dot(normal, direction))
+            projection = float(np.dot(center - part.center, direction))
+            records.append((alignment, projection, int(face_index)))
+        records.sort(reverse=True)
+        count = max(3, min(12, max(3, part.face_count // 8)))
+        polar = [index for alignment, _, index in records if alignment > 0.20][:count]
+        return polar or [index for _, _, index in records[:count]]
+    return list(range(part.face_count))
+
+
 def _select_contact_face_pair(
     parent: PrimitivePart,
     child: PrimitivePart,
@@ -2622,6 +2946,7 @@ def _select_contact_face_pair(
     model_extent: float,
     connector_radius_ratio: float,
     connector_inset_ratio: float,
+    regular_templates: bool = False,
 ) -> dict[str, object]:
     """Select a facing pair jointly instead of choosing both faces independently.
 
@@ -2650,8 +2975,19 @@ def _select_contact_face_pair(
     preferred_axis = np.asarray(edge["interface_axis_u"], dtype=np.float64)
     target_radius = max(float(connector_radius_ratio) * model_extent, model_extent * 1e-5)
 
+    parent_face_indices = (
+        _regular_attachment_face_indices(parent, desired_parent)
+        if regular_templates
+        else list(range(parent.face_count))
+    )
+    child_face_indices = (
+        _regular_attachment_face_indices(child, desired_child)
+        if regular_templates
+        else list(range(child.face_count))
+    )
+
     best: tuple[float, dict[str, object]] | None = None
-    for parent_face_index in range(parent.face_count):
+    for parent_face_index in parent_face_indices:
         parent_points, parent_face_center, parent_normal = _face_geometry(
             parent, parent_face_index
         )
@@ -2669,7 +3005,7 @@ def _select_contact_face_pair(
         )
         if parent_capacity <= model_extent * 1e-8:
             continue
-        for child_face_index in range(child.face_count):
+        for child_face_index in child_face_indices:
             child_points, child_face_center, child_normal = _face_geometry(
                 child, child_face_index
             )
@@ -2747,16 +3083,31 @@ def _select_contact_face_pair(
                 "desired_parent": desired_parent,
                 "connector_length": float(connector_length),
                 "selection_score": float(score),
+                "regular_attachment_only": bool(regular_templates),
             }
             candidate = (float(score), record)
             if best is None or candidate[0] < best[0]:
                 best = candidate
 
+    if best is None and regular_templates:
+        fallback = _select_contact_face_pair(
+            parent,
+            child,
+            edge,
+            model_extent=model_extent,
+            connector_radius_ratio=connector_radius_ratio,
+            connector_inset_ratio=connector_inset_ratio,
+            regular_templates=False,
+        )
+        fallback["regular_attachment_fallback"] = True
+        return fallback
     if best is None:
         raise ValueError(
             f"No usable connector face pair for segments {parent.segment_id} and {child.segment_id}"
         )
-    return best[1]
+    result = best[1]
+    result["regular_attachment_fallback"] = False
+    return result
 
 
 def _direct_face_contact_area(
@@ -2833,20 +3184,38 @@ def _build_connector_part(
     connector_sides: int,
     connector_radius_ratio: float,
     connector_min_length_ratio: float,
+    regular_templates: bool = False,
+    max_face_area_ratio: float = 1.0,
 ) -> tuple[PrimitivePart, dict[str, object]]:
     sides = int(connector_sides)
     boundary_length = float(edge["boundary_length"])
     base_radius = max(float(connector_radius_ratio) * model_extent, model_extent * 1e-5)
     if boundary_length > 0.0:
         equivalent_radius = boundary_length / (2.0 * np.pi)
-        requested_radius = max(base_radius, min(2.5 * base_radius, 0.55 * equivalent_radius))
+        if regular_templates:
+            # Canonical templates must never inherit a large, irregular source
+            # seam as a visible flange.  Use the seam only to reduce the joint
+            # size; never enlarge it beyond a modest template-scaled radius.
+            requested_radius = max(
+                0.45 * base_radius,
+                min(1.25 * base_radius, 0.45 * equivalent_radius),
+            )
+        else:
+            requested_radius = max(base_radius, min(2.5 * base_radius, 0.55 * equivalent_radius))
     else:
         requested_radius = base_radius
     available_radius = 0.72 * min(
         float(selection["parent_capacity"]),
         float(selection["child_capacity"]),
     )
-    radius = min(requested_radius, available_radius)
+    face_area = max(
+        min(float(selection["parent_area"]), float(selection["child_area"])),
+        model_extent * model_extent * 1e-12,
+    )
+    polygon_factor = 0.5 * sides * float(np.sin(2.0 * np.pi / sides))
+    max_patch_area = max(float(max_face_area_ratio), 1e-6) * face_area
+    max_radius_by_area = float(np.sqrt(max_patch_area / max(polygon_factor, 1e-12)))
+    radius = min(requested_radius, available_radius, max_radius_by_area)
     minimum_radius = model_extent * 2e-5
     if radius <= minimum_radius:
         raise ValueError(
@@ -2916,8 +3285,14 @@ def _build_connector_part(
         "child_patch_center": child_center.tolist(),
         "patch_radius": float(radius),
         "patch_sides": int(sides),
+        "regular_template_joint": bool(regular_templates),
+        "max_face_area_ratio": float(max_face_area_ratio),
+        "regular_attachment_only": bool(selection.get("regular_attachment_only", False)),
+        "regular_attachment_fallback": bool(selection.get("regular_attachment_fallback", False)),
         "parent_contact_area": float(contact_area),
         "child_contact_area": float(contact_area),
+        "selected_parent_face_area": float(selection["parent_area"]),
+        "selected_child_face_area": float(selection["child_area"]),
         "connector_length": float(connector_length),
         "connector_embedded_for_min_length": bool(embedded),
         "face_pair_selection_score": float(selection["selection_score"]),
@@ -2996,6 +3371,7 @@ def _enforce_primitive_contacts_connector(
             model_extent=model_extent,
             connector_radius_ratio=config.connector_radius_ratio,
             connector_inset_ratio=config.connector_inset_ratio,
+            regular_templates=(str(config.template_mode).strip().lower() == "regular"),
         )
         direct_area, plane_error, normal_alignment = _direct_face_contact_area(
             selection,
@@ -3042,6 +3418,8 @@ def _enforce_primitive_contacts_connector(
                 connector_sides=config.connector_sides,
                 connector_radius_ratio=config.connector_radius_ratio,
                 connector_min_length_ratio=config.connector_min_length_ratio,
+                regular_templates=(str(config.template_mode).strip().lower() == "regular"),
+                max_face_area_ratio=config.regular_connector_max_face_area_ratio,
             )
             connectors.append(connector)
             record = {**base_record, **connector_record}
@@ -3882,19 +4260,30 @@ def _enforce_primitive_contacts_auto(
         pair_parts = [by_id[pair[0]], by_id[pair[1]]]
         contact = contacts[pair]
         if strength.classification == "strong":
-            interface = frozen_interfaces.get(pair)
-            if interface is None:
-                # Classification was strong but interface reconstruction failed;
-                # connector fallback keeps the pipeline alive without moving parts.
+            if str(config.template_mode).strip().lower() == "regular":
+                # Preserve canonical template topology.  A strong source seam
+                # chooses existing attachment faces and a bounded connector; it
+                # never cuts a large arbitrary polygon into either primitive.
                 pair_records, pair_connectors = _enforce_primitive_contacts_connector(
                     pair_parts, {pair: contact}, config
                 )
                 for record in pair_records:
-                    record["auto_contact_fallback"] = "strong_missing_frozen_interface_connector"
+                    record["auto_contact_regular_template"] = True
+                    record["auto_contact_fallback"] = "regular_template_shape_preserving_joint"
             else:
-                pair_records, pair_connectors = _enforce_primitive_contacts_fixed(
-                    pair_parts, {pair: contact}, {pair: interface}, config
-                )
+                interface = frozen_interfaces.get(pair)
+                if interface is None:
+                    # Classification was strong but interface reconstruction failed;
+                    # connector fallback keeps the pipeline alive without moving parts.
+                    pair_records, pair_connectors = _enforce_primitive_contacts_connector(
+                        pair_parts, {pair: contact}, config
+                    )
+                    for record in pair_records:
+                        record["auto_contact_fallback"] = "strong_missing_frozen_interface_connector"
+                else:
+                    pair_records, pair_connectors = _enforce_primitive_contacts_fixed(
+                        pair_parts, {pair: contact}, {pair: interface}, config
+                    )
             append_pair_result(pair, pair_records, pair_connectors, strength)
         elif strength.classification == "medium" and medium_mode == "connector":
             try:
@@ -4041,6 +4430,21 @@ def _enforce_primitive_contacts(
     if mode == "connector":
         return _enforce_primitive_contacts_connector(source_parts, contacts, config)
     if mode == "fixed":
+        if str(config.template_mode).strip().lower() == "regular":
+            records, connectors = _enforce_primitive_contacts_connector(
+                source_parts, contacts, config
+            )
+            for record in records:
+                record["requested_contact_mode"] = "fixed"
+                record["contact_mode"] = (
+                    "regular_direct_face"
+                    if record.get("connector_segment_id") is None
+                    else "regular_shape_preserving_connector"
+                )
+            for part in source_parts:
+                part.metadata["requested_contact_mode"] = "fixed"
+                part.metadata["contact_mode"] = "regular_shape_preserving"
+            return records, connectors
         return _enforce_primitive_contacts_fixed(
             source_parts, contacts, frozen_interfaces or {}, config
         )
@@ -5607,6 +6011,15 @@ def fit_primitives_from_labels(
         raise ValueError("primitive max_sides must be >= 3")
     if config.fit_samples < 128:
         raise ValueError("primitive fit_samples must be >= 128")
+    template_mode = str(config.template_mode).strip().lower()
+    if template_mode not in {"regular", "adaptive"}:
+        raise ValueError("primitive template_mode must be regular or adaptive")
+    if config.regularity_weight < 0.0:
+        raise ValueError("primitive regularity_weight must be >= 0")
+    if not 0.0 < config.regular_connector_max_face_area_ratio <= 0.50:
+        raise ValueError(
+            "primitive regular_connector_max_face_area_ratio must be in (0, 0.5]"
+        )
     if config.contact_overlap_ratio < 0.0:
         raise ValueError("primitive contact_overlap_ratio must be >= 0")
     contact_mode = str(config.contact_mode).strip().lower()
@@ -5656,6 +6069,12 @@ def fit_primitives_from_labels(
         raise ValueError("primitive contact_min_edge_count must be >= 1")
     if str(config.contact_medium_mode).strip().lower() not in {"connector", "separate"}:
         raise ValueError("primitive contact_medium_mode must be connector or separate")
+    if config.contact_proximity_ratio < 0.0:
+        raise ValueError("primitive contact_proximity_ratio must be >= 0")
+    if config.contact_proximity_min_points < 1:
+        raise ValueError("primitive contact_proximity_min_points must be >= 1")
+    if not 0.0 < config.contact_proximity_min_coverage <= 1.0:
+        raise ValueError("primitive contact_proximity_min_coverage must be in (0, 1]")
     validation_policy = str(config.validation_policy).strip().lower()
     if validation_policy not in {"strict", "repair", "warn"}:
         raise ValueError("primitive validation_policy must be strict, repair, or warn")
@@ -5690,6 +6109,13 @@ def fit_primitives_from_labels(
     )
     valid_segment_ids = set(cluster_faces)
     source_contacts = _source_label_contacts(mesh, grouped_labels, valid_segment_ids)
+    source_contacts = _augment_contacts_with_spatial_proximity(
+        mesh,
+        cluster_faces,
+        source_contacts,
+        config,
+        model_extent,
+    )
     source_adjacency_pairs = set(source_contacts)
     contact_mode = str(config.contact_mode).strip().lower()
     build_interface_geometry = bool(
@@ -5718,6 +6144,11 @@ def fit_primitives_from_labels(
         }
     else:
         frozen_interfaces = all_frozen_interfaces
+    if template_mode == "regular":
+        # Regular templates are fitted once and remain topologically immutable.
+        # Source seam polygons are retained only for strength diagnostics; no
+        # interface is inserted into a primitive body during fitting.
+        frozen_interfaces = {}
     fixed_mode = bool(config.preserve_contacts and contact_mode == "fixed")
     auto_mode = bool(config.preserve_contacts and contact_mode == "auto")
     strong_contact_pairs = {
@@ -5741,6 +6172,14 @@ def fit_primitives_from_labels(
         total_area,
         source_contacts,
     )
+    if template_mode == "regular":
+        if surface_fit_ids:
+            print(
+                "[PrimitiveTemplate] regular mode keeps canonical closed templates; "
+                f"disabled constrained-surface groups={sorted(int(v) for v in surface_fit_ids)}",
+                flush=True,
+            )
+        surface_fit_ids = set()
     if surface_fit_ids:
         print(
             "[PrimitiveHybrid] constrained surface groups="
@@ -5919,6 +6358,9 @@ def fit_primitives_from_labels(
                 "surface_patch_internal_seams_removed": internal_decisions,
                 "hybrid_grouping_decisions": grouping_decisions,
                 "constrained_surface_fit": bool(int(label_id) in surface_fit_ids),
+                "primitive_template_mode": str(template_mode),
+                "canonical_template_topology_locked": bool(template_mode == "regular"),
+                "local_interface_deformation_allowed": bool(template_mode == "adaptive"),
             }
         )
         simplifier_note = ""
@@ -5966,6 +6408,14 @@ def fit_primitives_from_labels(
             part.metadata["overlap_resolution_enabled"] = False
             part.metadata["nonoverlap_constraint_satisfied"] = None
 
+    regular_shape_references = (
+        {
+            int(part.segment_id): _normalised_template_edge_lengths(part)
+            for part in parts
+        }
+        if template_mode == "regular"
+        else {}
+    )
     source_parts = parts
     if config.preserve_contacts:
         contact_records, connector_parts = _enforce_primitive_contacts(
@@ -5981,6 +6431,23 @@ def fit_primitives_from_labels(
         for part in source_parts:
             part.metadata["contact_constraint_enabled"] = False
             part.metadata["contact_graph_connected"] = None
+
+    if template_mode == "regular":
+        for part in source_parts:
+            error = _template_shape_signature_error(
+                regular_shape_references[int(part.segment_id)], part
+            )
+            preserved = bool(np.isfinite(error) and error <= 1e-8)
+            part.metadata["regular_template_shape_signature_error"] = float(error)
+            part.metadata["regular_template_shape_preserved_after_contacts"] = preserved
+            if not preserved:
+                message = (
+                    "canonical primitive topology/edge proportions changed during contact "
+                    f"processing for segment {int(part.segment_id)} (error={error:.6g})"
+                )
+                if validation_policy == "strict":
+                    raise ValueError(message)
+                print(f"[PrimitiveTemplate][WARNING] {message}", flush=True)
 
     for part in source_parts:
         part.metadata["source_adjacent_segment_ids"] = sorted(

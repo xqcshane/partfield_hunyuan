@@ -83,6 +83,9 @@ class PipelineConfig:
     primitive_max_sides: int = 24
     primitive_fit_samples: int = 2500
     primitive_complexity_weight: float = 0.025
+    primitive_template_mode: str = "regular"
+    primitive_regularity_weight: float = 0.08
+    primitive_regular_connector_max_face_area_ratio: float = 0.08
     primitive_resolve_overlaps: bool = True
     primitive_preserve_contacts: bool = True
     primitive_contact_overlap_ratio: float = 0.0
@@ -109,6 +112,9 @@ class PipelineConfig:
     primitive_contact_strong_threshold: float = 0.55
     primitive_contact_min_edge_count: int = 6
     primitive_contact_medium_mode: str = "connector"
+    primitive_contact_proximity_ratio: float = 0.015
+    primitive_contact_proximity_min_points: int = 8
+    primitive_contact_proximity_min_coverage: float = 0.01
     simplify_faces: int = 50_000
     force: bool = False
 
@@ -193,6 +199,11 @@ def _run_primitive_postprocess(
         max_sides=config.primitive_max_sides,
         fit_samples=config.primitive_fit_samples,
         complexity_weight=config.primitive_complexity_weight,
+        template_mode=config.primitive_template_mode,
+        regularity_weight=config.primitive_regularity_weight,
+        regular_connector_max_face_area_ratio=(
+            config.primitive_regular_connector_max_face_area_ratio
+        ),
         allowed_types=parse_primitive_types(config.primitive_types),
         resolve_overlaps=config.primitive_resolve_overlaps,
         overlap_gap_ratio=config.part_gap_ratio,
@@ -221,6 +232,9 @@ def _run_primitive_postprocess(
         contact_strong_threshold=config.primitive_contact_strong_threshold,
         contact_min_edge_count=config.primitive_contact_min_edge_count,
         contact_medium_mode=config.primitive_contact_medium_mode,
+        contact_proximity_ratio=config.primitive_contact_proximity_ratio,
+        contact_proximity_min_points=config.primitive_contact_proximity_min_points,
+        contact_proximity_min_coverage=config.primitive_contact_proximity_min_coverage,
         category=config.category,
         forward_axis=config.forward_axis,
     )
@@ -413,6 +427,11 @@ def _run_primitive_postprocess(
             "primitive_max_sides": int(config.primitive_max_sides),
             "primitive_fit_samples": int(config.primitive_fit_samples),
             "primitive_complexity_weight": float(config.primitive_complexity_weight),
+            "primitive_template_mode": str(config.primitive_template_mode),
+            "primitive_regularity_weight": float(config.primitive_regularity_weight),
+            "primitive_regular_connector_max_face_area_ratio": float(
+                config.primitive_regular_connector_max_face_area_ratio
+            ),
             "primitive_resolve_overlaps": bool(config.primitive_resolve_overlaps),
             "primitive_preserve_contacts": bool(config.primitive_preserve_contacts),
             "primitive_contact_overlap_ratio": float(config.primitive_contact_overlap_ratio),
@@ -474,6 +493,15 @@ def _run_primitive_postprocess(
             ),
             "primitive_contact_medium_mode": str(
                 config.primitive_contact_medium_mode
+            ),
+            "primitive_contact_proximity_ratio": float(
+                config.primitive_contact_proximity_ratio
+            ),
+            "primitive_contact_proximity_min_points": int(
+                config.primitive_contact_proximity_min_points
+            ),
+            "primitive_contact_proximity_min_coverage": float(
+                config.primitive_contact_proximity_min_coverage
             ),
             "surface_patch_groups": [
                 part.metadata.get("source_segment_ids", [int(part.segment_id)])

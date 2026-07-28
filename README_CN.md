@@ -949,3 +949,27 @@ bash run_fox_primitive_v32_auto_contact_fitonly.sh
 ```
 
 注意：V32 的 primitive 仍然是代码生成的 box、prism、frustum、cone、ellipsoid 和 convex 候选；尚未接入外部 OBJ/GLB 预设模型库。
+
+## V33：规整模板 Primitive（推荐默认）
+
+为避免瓶盖下方出现大法兰、动物部件塌陷，以及固定接口切坏 primitive，V33 新增：
+
+```bash
+--primitive-template-mode regular
+```
+
+该模式锁定程序化 `box/prism/frustum/cone/ellipsoid` 的拓扑；接触只使用预定义端面/极区或小型 connector，不再向主体插入任意 PartField 接口多边形。Hunyuan 视觉接触但网格未焊接时，可使用：
+
+```bash
+--primitive-contact-proximity-ratio 0.015
+--primitive-contact-proximity-min-points 8
+--primitive-contact-proximity-min-coverage 0.01
+```
+
+旧的 constrained surface 与冻结接口局部变形保留在：
+
+```bash
+--primitive-template-mode adaptive
+```
+
+完整说明见 `CHANGES_V33_REGULAR_TEMPLATE_PRIMITIVES.md`。

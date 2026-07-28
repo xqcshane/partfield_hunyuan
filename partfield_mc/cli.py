@@ -238,6 +238,35 @@ def build_parser() -> argparse.ArgumentParser:
         ),
     )
     p.add_argument(
+        "--primitive-template-mode",
+        choices=("regular", "adaptive"),
+        default="regular",
+        help=(
+            "Primitive geometry policy. regular keeps canonical box/prism/frustum/cone/ellipsoid "
+            "topology unchanged and restores contacts only through existing attachment faces or "
+            "small bounded connectors. adaptive enables legacy frozen-interface cutting and "
+            "constrained-surface deformation."
+        ),
+    )
+    p.add_argument(
+        "--primitive-regularity-weight",
+        type=float,
+        default=0.08,
+        help=(
+            "Selection penalty for irregular source-support convex candidates in regular template "
+            "mode. Higher values prefer canonical symmetric templates."
+        ),
+    )
+    p.add_argument(
+        "--primitive-regular-connector-max-face-area-ratio",
+        type=float,
+        default=0.08,
+        help=(
+            "Maximum connector end area as a fraction of the smaller selected attachment face in "
+            "regular template mode. Prevents wide flange-like joints (0-0.5)."
+        ),
+    )
+    p.add_argument(
         "--primitive-types",
         default="auto",
         help=(
@@ -338,6 +367,30 @@ def build_parser() -> argparse.ArgumentParser:
         help=(
             "Handling for medium-strength seams in auto mode. connector preserves placement and adds "
             "a small paper joint; separate permits a gap without moving the main parts."
+        ),
+    )
+    p.add_argument(
+        "--primitive-contact-proximity-ratio",
+        type=float,
+        default=0.015,
+        help=(
+            "Maximum source-surface gap, as a fraction of model extent, for inferring a contact "
+            "when Hunyuan parts are spatially close but do not share topology. Set 0 to disable."
+        ),
+    )
+    p.add_argument(
+        "--primitive-contact-proximity-min-points",
+        type=int,
+        default=8,
+        help="Minimum near-surface source points required for an inferred proximity contact.",
+    )
+    p.add_argument(
+        "--primitive-contact-proximity-min-coverage",
+        type=float,
+        default=0.01,
+        help=(
+            "Minimum fraction of the smaller part's sampled source vertices that must lie within "
+            "the proximity distance before a spatial contact is inferred."
         ),
     )
     p.add_argument(
@@ -500,6 +553,11 @@ def main(argv: list[str] | None = None) -> int:
         primitive_max_sides=args.primitive_max_sides,
         primitive_fit_samples=args.primitive_fit_samples,
         primitive_complexity_weight=args.primitive_complexity_weight,
+        primitive_template_mode=args.primitive_template_mode,
+        primitive_regularity_weight=args.primitive_regularity_weight,
+        primitive_regular_connector_max_face_area_ratio=(
+            args.primitive_regular_connector_max_face_area_ratio
+        ),
         primitive_resolve_overlaps=not args.no_primitive_resolve_overlaps,
         primitive_preserve_contacts=not args.no_primitive_preserve_contacts,
         primitive_contact_overlap_ratio=args.primitive_contact_overlap_ratio,
@@ -526,6 +584,11 @@ def main(argv: list[str] | None = None) -> int:
         primitive_contact_strong_threshold=args.primitive_contact_strong_threshold,
         primitive_contact_min_edge_count=args.primitive_contact_min_edge_count,
         primitive_contact_medium_mode=args.primitive_contact_medium_mode,
+        primitive_contact_proximity_ratio=args.primitive_contact_proximity_ratio,
+        primitive_contact_proximity_min_points=args.primitive_contact_proximity_min_points,
+        primitive_contact_proximity_min_coverage=(
+            args.primitive_contact_proximity_min_coverage
+        ),
         simplify_faces=args.simplify_faces,
         force=args.force,
     )

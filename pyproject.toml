@@ -4,8 +4,8 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "partfield-mc-pipeline"
-version = "0.32.0"
-description = "PartField to textured paper models with mandatory constrained simplification, repair-oriented interface validation, and resilient closed primitive fallbacks"
+version = "0.33.0"
+description = "PartField to textured paper models with topology-locked regular primitive templates, bounded joints, and spatial contact inference"
 requires-python = ">=3.10"
 dependencies = [
   "numpy>=1.24",
